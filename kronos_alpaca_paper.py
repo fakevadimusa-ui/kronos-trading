@@ -162,13 +162,17 @@ def check_daily_loss(client: TradingClient, equity: float) -> bool:
         return True
 
 
-def check_total_dd(account) -> bool:
-    equity      = float(account.equity)
-    last_equity = float(account.last_equity)
-    if last_equity <= 0:
-        return True
-    dd = (equity - last_equity) / last_equity
-    log(f"Total drawdown vs last_equity: {dd:+.2%}")
+def check_total_dd(client: TradingClient, account) -> bool:
+    """Return True if drawdown from all-time equity peak is within 8%."""
+    equity = float(account.equity)
+    try:
+        history  = client.get_portfolio_history(period="all")
+        equities = [v for v in (history.equity or []) if v]
+        peak     = float(max(equities)) if equities else equity
+    except Exception:
+        peak = max(equity, float(account.last_equity) if float(account.last_equity) > 0 else equity)
+    dd = (equity - peak) / peak
+    log(f"Peak equity: ${peak:,.2f} | Current: ${equity:,.2f} | DD from peak: {dd:+.2%}")
     return dd > TOTAL_DD_LIMIT
 
 
@@ -224,7 +228,7 @@ def main() -> None:
     equity  = float(account.equity)
     log(f"Alpaca paper account equity: ${equity:,.2f}")
 
-    if not check_total_dd(account):
+    if not check_total_dd(client, account):
         msg = f"🚨 <b>NVDA | HALTED</b>\nTotal DD limit hit\nAccount: ${equity:,.0f}"
         log(msg)
         send_telegram(msg)
