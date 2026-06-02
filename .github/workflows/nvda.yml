@@ -1,0 +1,44 @@
+name: Kronos NVDA
+
+on:
+  schedule:
+    # 6:30 AM PDT (UTC-7, summer) = 13:30 UTC
+    # In winter (PST, UTC-8) this fires at 5:30 AM — still before open, fine
+    - cron: '30 13 * * 1-5'
+  workflow_dispatch:  # allow manual trigger from GitHub UI
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Clone Kronos
+        run: git clone --depth=1 https://github.com/shiyu-coder/Kronos.git
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-kronos-${{ hashFiles('requirements.txt') }}
+          restore-keys: hf-kronos-
+
+      - name: Install PyTorch (CPU)
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run NVDA bot
+        env:
+          ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
+          ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
+        run: python kronos_alpaca_paper.py
