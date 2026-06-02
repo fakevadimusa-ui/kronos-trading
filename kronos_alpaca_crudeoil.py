@@ -2,24 +2,13 @@
 Kronos Crude Oil — Direct Alpaca Paper Trading Script
 ======================================================
 Signal source : CL=F (WTI Crude Oil futures via yfinance)
-Execution     : USO (United States Oil ETF on Alpaca, 0.976 correlation to CL=F)
-For The5ers   : replace USO with USOIL/XTIUSD via MT5 CFD
+Execution     : USO (long) / SCO (2x inverse, short)
 
 Strategy (confirmed OOS 2024-07-01+):
   WR=35.7%, PF=2.054, DD=1.99%, 14 trades
 
-Signal logic:
-  - 1D SMA50 filter: CL=F price must be above SMA50 for longs, below for shorts
-  - Kronos threshold: predicted next-day move must be >= 1.0%
-  - 1% SL, 3% TP (1:3 RR), 1% account risk per trade
-
-Risk limits:
-  - Max 1 open position at a time
-  - 4% daily loss halt
-  - 8% total drawdown halt
-
-Credentials: ALPACA_KEY / ALPACA_SECRET env vars (GitHub Secrets),
-             or ~/freqtrade/user_data/config_kronos_nvda.json locally.
+Credentials (env vars or JSON fallback):
+  ALPACA_KEY, ALPACA_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 """
 
 import json
@@ -30,11 +19,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import requests
 import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-# Kronos path: cloned as ./Kronos (GitHub Actions) or ~/Kronos (local Mac)
 for _p in (Path("Kronos"), Path.home() / "Kronos"):
     if _p.exists():
         sys.path.insert(0, str(_p))
@@ -81,8 +70,23 @@ def log(msg: str) -> None:
     print(f"[{ts}] {msg}", flush=True)
 
 
+def send_telegram(msg: str) -> None:
+    token   = os.environ.get("TELEGRAM_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
 def load_credentials() -> tuple[str, str]:
-    key = os.environ.get("ALPACA_KEY")
+    key    = os.environ.get("ALPACA_KEY")
     secret = os.environ.get("ALPACA_SECRET")
     if key and secret:
         return key, secret
@@ -185,11 +189,10 @@ def has_open_position(client: TradingClient) -> bool:
 
 def place_bracket_order(
     client: TradingClient,
-    side: OrderSide,
     symbol: str,
     shares: int,
     entry_price: float,
-) -> None:
+) -> tuple[float, float]:
     tp_price = round(entry_price * (1 + TP_PCT), 2)
     sl_price = round(entry_price * (1 - SL_PCT), 2)
 
@@ -206,6 +209,7 @@ def place_bracket_order(
     )
     order = client.submit_order(request)
     log(f"Order submitted: id={order.id} status={order.status}")
+    return sl_price, tp_price
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -222,14 +226,19 @@ def main() -> None:
     log(f"Alpaca paper equity: ${equity:,.2f}")
 
     if not check_total_dd(account):
-        log(f"HALT: total drawdown >= {abs(TOTAL_DD_LIMIT):.0%} — no trading today")
+        msg = f"🚨 <b>CL=F | HALTED</b>\nTotal DD limit hit\nAccount: ${equity:,.0f}"
+        log(msg)
+        send_telegram(msg)
         return
 
     if not check_daily_loss(client, equity):
-        log(f"HALT: daily loss >= {abs(DAILY_DD_LIMIT):.0%} — no trading today")
+        msg = f"🚨 <b>CL=F | HALTED</b>\nDaily loss limit hit\nAccount: ${equity:,.0f}"
+        log(msg)
+        send_telegram(msg)
         return
 
     if has_open_position(client):
+        send_telegram(f"📌 <b>CL=F</b> | Position already open — skipped\nAccount: ${equity:,.0f}")
         return
 
     df    = fetch_signal_data()
@@ -242,35 +251,47 @@ def main() -> None:
 
     if not long_ok and not short_ok:
         log("Price exactly at SMA — no signal")
+        send_telegram(f"📊 <b>CL=F</b> | No signal (price at SMA50)\nAccount: ${equity:,.0f}")
         return
 
     predictor     = load_kronos()
     predicted_ret = kronos_predicted_return(predictor, df)
 
     if long_ok and predicted_ret >= THRESHOLD:
-        side = OrderSide.BUY
+        direction = "LONG"
     elif short_ok and predicted_ret <= -THRESHOLD:
-        side = OrderSide.SELL
+        direction = "SHORT"
     else:
-        direction = "long" if long_ok else "short"
-        needed    = f"≥+{THRESHOLD:.1%}" if long_ok else f"≤-{THRESHOLD:.1%}"
-        log(f"No trade: SMA50 allows {direction}, Kronos predicts {predicted_ret:+.3%} (need {needed})")
+        needed = f"≥+{THRESHOLD:.1%}" if long_ok else f"≤-{THRESHOLD:.1%}"
+        log(f"No trade: SMA50 allows {'long' if long_ok else 'short'}, Kronos predicts {predicted_ret:+.3%} (need {needed})")
+        send_telegram(
+            f"📊 <b>CL=F</b> | No trade\n"
+            f"Kronos: {predicted_ret:+.3%} (need {needed})\n"
+            f"CL=F @ ${close:.2f} | Account: ${equity:,.0f}"
+        )
         return
 
     risk_dollars = equity * RISK_PER_TRADE
 
-    if side == OrderSide.BUY:
+    if direction == "LONG":
         exec_sym   = EXEC_SYMBOL
         exec_price = fetch_exec_price(EXEC_SYMBOL)
         shares     = max(1, int(risk_dollars / (exec_price * SL_PCT)))
         log(f"Long crude → buying {shares}x {exec_sym} (risk ${risk_dollars:.0f})")
-        place_bracket_order(client, OrderSide.BUY, exec_sym, shares, exec_price)
     else:
         exec_sym   = EXEC_SYMBOL_INV
         exec_price = fetch_exec_price(EXEC_SYMBOL_INV)
         shares     = max(1, int((risk_dollars / (exec_price * SL_PCT)) / 2))
-        log(f"Short crude → buying {shares}x {exec_sym} (2x inverse, halved for leverage, risk ${risk_dollars:.0f})")
-        place_bracket_order(client, OrderSide.BUY, exec_sym, shares, exec_price)
+        log(f"Short crude → buying {shares}x {exec_sym} (2x inverse, risk ${risk_dollars:.0f})")
+
+    sl_price, tp_price = place_bracket_order(client, exec_sym, shares, exec_price)
+
+    send_telegram(
+        f"🔔 <b>CL=F | {direction} FIRED</b>\n"
+        f"{shares}x {exec_sym} @ ${exec_price:.2f}\n"
+        f"SL=${sl_price} | TP=${tp_price}\n"
+        f"Kronos: {predicted_ret:+.3%} | Account: ${equity:,.0f}"
+    )
 
     log("=== Run complete ===")
 
