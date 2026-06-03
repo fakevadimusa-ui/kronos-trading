@@ -1,14 +1,16 @@
 """
 ICT Alpaca Trader — ES1! Signal / SPY Execution
 =================================================
-Runs the ICT model on 15-minute ES1! futures data (from TradingView Desktop)
-during kill zones and executes market orders on SPY via Alpaca (paper → live → prop firm).
+Runs the ICT model on 15-minute data during kill zones and executes
+market orders on SPY via Alpaca (paper → live → prop firm).
 
-Data source priority:
-  1. TradingView Desktop (CDP at localhost:9222) — ES1! futures (authentic ICT instrument)
-  2. Fallback: yfinance SPY — used when TradingView is not running
+Data source priority (automatic fallback):
+  1. TradingView Desktop (CDP at localhost:9222) — ES1! futures, Mac-local only
+  2. Alpaca data API — real-time SPY bars, works 24/7 on VPS with no Mac
+  3. yfinance SPY — last-resort fallback (includes pre-market for London kill zone)
 
-SL/TP translation: ES1! risk % → SPY bracket prices via Alpaca last trade price.
+SL/TP translation: when data source is TradingView (ES1!), risk % is preserved
+and re-applied to current SPY price for Alpaca bracket orders.
 
 Schedule (cron, PT weekdays):
   */15 0,1    * * 1-5   # London kill zone  (3–5 AM ET = 12–2 AM PT)
@@ -30,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import warnings
@@ -51,6 +54,9 @@ from alpaca.trading.requests import (
     GetPortfolioHistoryRequest,
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from ict_model import ICTModel
 
@@ -114,12 +120,21 @@ def load_credentials() -> tuple[str, str]:
 STATE_PATH = Path.home() / "freqtrade/user_data/logs/ict_state.json"
 
 
+def _is_tradingview_running() -> bool:
+    """Check if TradingView Desktop's CDP port is open (fast, 0.5s max)."""
+    try:
+        with socket.create_connection(("localhost", 9222), timeout=0.5):
+            return True
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return False
+
+
 def _tv_fetch_bars(tf: str, count: int) -> pd.DataFrame | None:
     """
     Call tv_fetch.js to get OHLCV bars for SIGNAL_SYMBOL at the given timeframe.
     Returns a DataFrame with lowercase columns and UTC DatetimeIndex, or None on failure.
     """
-    if not TV_FETCH.exists():
+    if not TV_FETCH.exists() or not _is_tradingview_running():
         return None
     try:
         result = subprocess.run(
@@ -145,21 +160,68 @@ def _tv_fetch_bars(tf: str, count: int) -> pd.DataFrame | None:
         return None
 
 
+def fetch_data_alpaca() -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    """
+    Fetch SPY bars from Alpaca data API — works 24/7 on any cloud host.
+    Returns (df_15m, df_1h) or (None, None) on failure.
+    """
+    try:
+        key, secret = load_credentials()
+        data_client = StockHistoricalDataClient(key, secret)
+        now = datetime.now(timezone.utc)
+
+        def _get_bars(tf_value: int, tf_unit, days_back: int) -> pd.DataFrame:
+            req = StockBarsRequest(
+                symbol_or_symbols=SYMBOL,
+                timeframe=TimeFrame(tf_value, tf_unit),
+                start=now - timedelta(days=days_back),
+                end=now,
+                feed="iex",
+            )
+            bars = data_client.get_stock_bars(req)
+            df = bars.df
+            if isinstance(df.index, pd.MultiIndex):
+                df = df.xs(SYMBOL, level="symbol")
+            df.index.name = "time"
+            df = df[["open", "high", "low", "close", "volume"]].copy()
+            df.columns = [c.lower() for c in df.columns]
+            df.dropna(inplace=True)
+            return df
+
+        df_15m = _get_bars(15, TimeFrameUnit.Minute, 5)
+        df_1h  = _get_bars(1,  TimeFrameUnit.Hour,   60)
+
+        if len(df_15m) >= 25 and len(df_1h) >= 20:
+            return df_15m, df_1h
+        log(f"[WARN] Alpaca data API returned too few bars: 15m={len(df_15m)} 1H={len(df_1h)}")
+        return None, None
+    except Exception as e:
+        log(f"[WARN] Alpaca data API failed: {e}")
+        return None, None
+
+
 def fetch_data() -> tuple[pd.DataFrame, pd.DataFrame, str]:
     """
     Returns (df_15m, df_1h, data_source).
-    Tries TradingView ES1! first; falls back to yfinance SPY.
+    Priority: 1) TradingView ES1! (Mac)  2) Alpaca API (VPS/cloud)  3) yfinance (fallback)
     """
-    log(f"Fetching data — primary: TradingView {SIGNAL_SYMBOL}, fallback: yfinance {SYMBOL}")
+    log(f"Fetching data — 1) TradingView {SIGNAL_SYMBOL}  2) Alpaca API  3) yfinance {SYMBOL}")
 
+    # 1. TradingView Desktop — best data, Mac-only
     df_15m = _tv_fetch_bars("15", 200)
     df_1h  = _tv_fetch_bars("60", 100)
-
     if df_15m is not None and df_1h is not None and len(df_15m) >= 25:
-        log(f"[DATA] TradingView {SIGNAL_SYMBOL} | 15m: {len(df_15m)} bars | 1H: {len(df_1h)} bars | last: {df_15m['close'].iloc[-1]:.2f}")
+        log(f"[DATA] TradingView {SIGNAL_SYMBOL} | 15m: {len(df_15m)} bars | last: {df_15m['close'].iloc[-1]:.2f}")
         return df_15m, df_1h, "tradingview"
 
-    log(f"[DATA] TradingView unavailable — falling back to yfinance {SYMBOL}")
+    # 2. Alpaca data API — real-time, works on VPS 24/7
+    df_15m, df_1h = fetch_data_alpaca()
+    if df_15m is not None and len(df_15m) >= 25:
+        log(f"[DATA] Alpaca API {SYMBOL} | 15m: {len(df_15m)} bars | last: {df_15m['close'].iloc[-1]:.2f}")
+        return df_15m, df_1h, "alpaca"
+
+    # 3. yfinance — last resort, includes pre-market for London kill zone
+    log(f"[DATA] Falling back to yfinance {SYMBOL}")
     df_15m = yf.download(SYMBOL, period=YF_PERIOD_15M, interval="15m",
                          auto_adjust=True, progress=False)
     df_1h  = yf.download(SYMBOL, period=YF_PERIOD_1H,  interval="1h",
@@ -169,7 +231,7 @@ def fetch_data() -> tuple[pd.DataFrame, pd.DataFrame, str]:
             df.columns = df.columns.get_level_values(0)
         df.columns = [str(c).lower() for c in df.columns]
         df.dropna(inplace=True)
-    log(f"[DATA] yfinance {SYMBOL} | 15m: {len(df_15m)} bars | 1H: {len(df_1h)} bars | last: {df_15m['close'].iloc[-1]:.2f}")
+    log(f"[DATA] yfinance {SYMBOL} | 15m: {len(df_15m)} bars | last: {df_15m['close'].iloc[-1]:.2f}")
     return df_15m, df_1h, "yfinance"
 
 
