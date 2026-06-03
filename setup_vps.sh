@@ -85,12 +85,12 @@ chmod +x "$APP_DIR/ict_cron.sh"
 step "Installing cron jobs"
 CRON_MARKER="# ICT-BOT-MANAGED"
 CRON_BLOCK="$CRON_MARKER
-# London kill zone — 3-5 AM ET (7-10 AM UTC covers EDT+EST)
-*/15 7,8,9 * * 1-5 $APP_DIR/ict_cron.sh >> $LOG_DIR/ict.log 2>&1
+# London kill zone — 3-5 AM ET (7-10 AM UTC covers EDT+EST) — every 5 min
+*/5 7,8,9 * * 1-5 $APP_DIR/ict_cron.sh >> $LOG_DIR/ict.log 2>&1
 0 10 * * 1-5 $APP_DIR/ict_cron.sh >> $LOG_DIR/ict.log 2>&1
-# NY AM kill zone — 7:30-10 AM ET (11:30 AM-3 PM UTC covers EDT+EST)
-30,45 11 * * 1-5 $APP_DIR/ict_cron.sh >> $LOG_DIR/ict.log 2>&1
-*/15 12,13,14 * * 1-5 $APP_DIR/ict_cron.sh >> $LOG_DIR/ict.log 2>&1
+# NY AM kill zone — 7:30-10 AM ET (11:30 AM-3 PM UTC covers EDT+EST) — every 5 min
+30,35,40,45,50,55 11 * * 1-5 $APP_DIR/ict_cron.sh >> $LOG_DIR/ict.log 2>&1
+*/5 12,13,14 * * 1-5 $APP_DIR/ict_cron.sh >> $LOG_DIR/ict.log 2>&1
 0 15 * * 1-5 $APP_DIR/ict_cron.sh >> $LOG_DIR/ict.log 2>&1"
 
 # Remove any existing ICT block, add fresh

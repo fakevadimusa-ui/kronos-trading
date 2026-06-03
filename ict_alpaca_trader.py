@@ -66,7 +66,9 @@ from ict_model import ICTModel
 # ══════════════════════════════════════════════════════════════════════════════
 
 CONFIG_PATH   = Path.home() / "freqtrade/user_data/config_kronos_nvda.json"
-TV_FETCH      = Path(__file__).parent / "tv_fetch.js"
+_TV_FETCH_PRIMARY  = Path.home() / "tradingview-mcp/tv_fetch.js"   # Mac: full deps
+_TV_FETCH_FALLBACK = Path(__file__).parent / "tv_fetch.js"          # repo backup
+TV_FETCH = _TV_FETCH_PRIMARY if _TV_FETCH_PRIMARY.exists() else _TV_FETCH_FALLBACK
 
 SIGNAL_SYMBOL = "CME_MINI_DL:ES1!"   # ICT analysis instrument (TradingView)
 SYMBOL        = "SPY"                  # Alpaca execution instrument
@@ -162,8 +164,8 @@ def _tv_fetch_bars(tf: str, count: int) -> pd.DataFrame | None:
 
 def fetch_data_alpaca() -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
     """
-    Fetch SPY bars from Alpaca data API — works 24/7 on any cloud host.
-    Returns (df_15m, df_1h) or (None, None) on failure.
+    Fetch SPY 5m + 1H bars from Alpaca data API — works 24/7 on any cloud host.
+    Returns (df_5m, df_1h) or (None, None) on failure.
     """
     try:
         key, secret = load_credentials()
@@ -188,12 +190,12 @@ def fetch_data_alpaca() -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
             df.dropna(inplace=True)
             return df
 
-        df_15m = _get_bars(15, TimeFrameUnit.Minute, 5)
-        df_1h  = _get_bars(1,  TimeFrameUnit.Hour,   60)
+        df_5m = _get_bars(5,  TimeFrameUnit.Minute, 7)
+        df_1h = _get_bars(1,  TimeFrameUnit.Hour,   60)
 
-        if len(df_15m) >= 25 and len(df_1h) >= 20:
-            return df_15m, df_1h
-        log(f"[WARN] Alpaca data API returned too few bars: 15m={len(df_15m)} 1H={len(df_1h)}")
+        if len(df_5m) >= 60 and len(df_1h) >= 20:
+            return df_5m, df_1h
+        log(f"[WARN] Alpaca data API returned too few bars: 5m={len(df_5m)} 1H={len(df_1h)}")
         return None, None
     except Exception as e:
         log(f"[WARN] Alpaca data API failed: {e}")
@@ -202,37 +204,37 @@ def fetch_data_alpaca() -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
 
 def fetch_data() -> tuple[pd.DataFrame, pd.DataFrame, str]:
     """
-    Returns (df_15m, df_1h, data_source).
+    Returns (df_5m, df_1h, data_source).
     Priority: 1) TradingView ES1! (Mac)  2) Alpaca API (VPS/cloud)  3) yfinance (fallback)
     """
     log(f"Fetching data — 1) TradingView {SIGNAL_SYMBOL}  2) Alpaca API  3) yfinance {SYMBOL}")
 
-    # 1. TradingView Desktop — best data, Mac-only
-    df_15m = _tv_fetch_bars("15", 200)
-    df_1h  = _tv_fetch_bars("60", 100)
-    if df_15m is not None and df_1h is not None and len(df_15m) >= 25:
-        log(f"[DATA] TradingView {SIGNAL_SYMBOL} | 15m: {len(df_15m)} bars | last: {df_15m['close'].iloc[-1]:.2f}")
-        return df_15m, df_1h, "tradingview"
+    # 1. TradingView Desktop — ES1! data, Mac-only
+    df_5m = _tv_fetch_bars("5", 400)
+    df_1h = _tv_fetch_bars("60", 100)
+    if df_5m is not None and df_1h is not None and len(df_5m) >= 60:
+        log(f"[DATA] TradingView {SIGNAL_SYMBOL} | 5m: {len(df_5m)} bars | last: {df_5m['close'].iloc[-1]:.2f}")
+        return df_5m, df_1h, "tradingview"
 
-    # 2. Alpaca data API — real-time, works on VPS 24/7
-    df_15m, df_1h = fetch_data_alpaca()
-    if df_15m is not None and len(df_15m) >= 25:
-        log(f"[DATA] Alpaca API {SYMBOL} | 15m: {len(df_15m)} bars | last: {df_15m['close'].iloc[-1]:.2f}")
-        return df_15m, df_1h, "alpaca"
+    # 2. Alpaca data API — real-time SPY, works on VPS 24/7
+    df_5m, df_1h = fetch_data_alpaca()
+    if df_5m is not None and len(df_5m) >= 60:
+        log(f"[DATA] Alpaca API {SYMBOL} | 5m: {len(df_5m)} bars | last: {df_5m['close'].iloc[-1]:.2f}")
+        return df_5m, df_1h, "alpaca"
 
     # 3. yfinance — last resort, includes pre-market for London kill zone
     log(f"[DATA] Falling back to yfinance {SYMBOL}")
-    df_15m = yf.download(SYMBOL, period=YF_PERIOD_15M, interval="15m",
-                         auto_adjust=True, progress=False)
-    df_1h  = yf.download(SYMBOL, period=YF_PERIOD_1H,  interval="1h",
-                         auto_adjust=True, progress=False)
-    for df in (df_15m, df_1h):
+    df_5m = yf.download(SYMBOL, period="7d",   interval="5m",
+                        auto_adjust=True, progress=False)
+    df_1h = yf.download(SYMBOL, period=YF_PERIOD_1H, interval="1h",
+                        auto_adjust=True, progress=False)
+    for df in (df_5m, df_1h):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df.columns = [str(c).lower() for c in df.columns]
         df.dropna(inplace=True)
-    log(f"[DATA] yfinance {SYMBOL} | 15m: {len(df_15m)} bars | last: {df_15m['close'].iloc[-1]:.2f}")
-    return df_15m, df_1h, "yfinance"
+    log(f"[DATA] yfinance {SYMBOL} | 5m: {len(df_5m)} bars | last: {df_5m['close'].iloc[-1]:.2f}")
+    return df_5m, df_1h, "yfinance"
 
 
 def translate_signal_to_spy(signal: dict, client) -> dict:
@@ -466,7 +468,7 @@ def main() -> None:
     # Reduce risk if halfway to daily limit
     risk_pct = RISK_PER_TRADE_SMALL if daily_dd <= DAILY_DD_LIMIT / 2 else RISK_PER_TRADE
 
-    model = ICTModel(swing_lookback=5, fvg_min_pct=0.0003, ob_lookback=30, rr_ratio=3.0)
+    model = ICTModel(tf_minutes=5, fvg_min_pct=0.0002, rr_ratio=3.0, displacement_factor=1.5)
 
     # ── Existing position check ────────────────────────────────────────────
     pos = get_ict_position(client)
@@ -477,8 +479,8 @@ def main() -> None:
         return
 
     # ── ICT signal generation ───────────────────────────────────────────────
-    df_15m, df_1h, data_source = fetch_data()
-    signal = model.get_signal(df_15m, df_1h)
+    df_5m, df_1h, data_source = fetch_data()
+    signal = model.get_signal(df_5m, df_1h)
 
     # Translate ES1! price levels → SPY prices when TradingView data was used
     if data_source == "tradingview" and signal["signal"] != "HOLD":

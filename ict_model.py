@@ -34,15 +34,24 @@ class ICTModel:
 
     def __init__(
         self,
-        swing_lookback: int = 5,
-        fvg_min_pct: float = 0.0003,
-        ob_lookback: int = 30,
+        tf_minutes: int = 5,
+        fvg_min_pct: float = 0.0002,
         rr_ratio: float = 3.0,
+        displacement_factor: float = 1.5,
     ):
-        self.swing_lookback = swing_lookback
-        self.fvg_min_pct    = fvg_min_pct
-        self.ob_lookback    = ob_lookback
-        self.rr_ratio       = rr_ratio
+        self.tf_minutes          = tf_minutes
+        self.fvg_min_pct         = fvg_min_pct
+        self.rr_ratio            = rr_ratio
+        self.displacement_factor = displacement_factor
+
+        # All windows auto-scale to keep consistent real-time coverage
+        # regardless of entry timeframe (5m, 15m, etc.)
+        # Anchored to 75-min swing lookback, 300-min FVG recency, 450-min OB recency
+        self.swing_lookback = max(3, round(75  / tf_minutes))
+        self.fvg_recency    = round(300 / tf_minutes)   # bars back to consider FVGs fresh
+        self.ob_recency     = round(450 / tf_minutes)   # bars back to consider OBs fresh
+        self.ob_lookback    = round(450 / tf_minutes)   # max lookback when finding OBs
+        self.min_bars       = max(25, round(300 / tf_minutes))
 
     # ──────────────────────────────────────────────────────────────────────────
     # SWING STRUCTURE
@@ -114,35 +123,49 @@ class ICTModel:
         """
         Bullish FVG:  candle[i].low  > candle[i-2].high  → gap above
         Bearish FVG:  candle[i].high < candle[i-2].low   → gap below
+
+        Displacement filter: the middle candle (candle[i-1]) must have a body
+        at least displacement_factor × the recent average body size.
+        This ensures the FVG was created by real momentum, not a doji gap.
         """
-        highs = df["high"].values
-        lows  = df["low"].values
-        fvgs  = []
+        opens  = df["open"].values
+        highs  = df["high"].values
+        lows   = df["low"].values
+        closes = df["close"].values
+        fvgs   = []
+
+        bodies     = np.abs(closes - opens)
+        avg_body   = np.convolve(bodies, np.ones(20) / 20, mode="same")
 
         for i in range(2, len(df)):
-            # Bullish
-            if lows[i] > highs[i-2]:
-                size = (lows[i] - highs[i-2]) / highs[i-2]
+            mid_body = bodies[i - 1]
+            has_disp = mid_body >= self.displacement_factor * avg_body[i - 1]
+
+            # Bullish FVG
+            if lows[i] > highs[i - 2]:
+                size = (lows[i] - highs[i - 2]) / highs[i - 2]
                 if size >= self.fvg_min_pct:
                     fvgs.append({
-                        "idx":    i,
-                        "type":   "BULL",
-                        "top":    lows[i],
-                        "bottom": highs[i-2],
-                        "mid":    (lows[i] + highs[i-2]) / 2,
-                        "size":   size,
+                        "idx":          i,
+                        "type":         "BULL",
+                        "top":          lows[i],
+                        "bottom":       highs[i - 2],
+                        "mid":          (lows[i] + highs[i - 2]) / 2,
+                        "size":         size,
+                        "displacement": has_disp,
                     })
-            # Bearish
-            elif highs[i] < lows[i-2]:
-                size = (lows[i-2] - highs[i]) / lows[i-2]
+            # Bearish FVG
+            elif highs[i] < lows[i - 2]:
+                size = (lows[i - 2] - highs[i]) / lows[i - 2]
                 if size >= self.fvg_min_pct:
                     fvgs.append({
-                        "idx":    i,
-                        "type":   "BEAR",
-                        "top":    lows[i-2],
-                        "bottom": highs[i],
-                        "mid":    (lows[i-2] + highs[i]) / 2,
-                        "size":   size,
+                        "idx":          i,
+                        "type":         "BEAR",
+                        "top":          lows[i - 2],
+                        "bottom":       highs[i],
+                        "mid":          (lows[i - 2] + highs[i]) / 2,
+                        "size":         size,
+                        "displacement": has_disp,
                     })
 
         return fvgs
@@ -255,21 +278,21 @@ class ICTModel:
 
     def get_signal(
         self,
-        df_15m:          pd.DataFrame,
+        df_entry:        pd.DataFrame,
         df_1h:           Optional[pd.DataFrame] = None,
         current_time_et: Optional[datetime]     = None,
     ) -> dict:
         """
-        Full ICT setup scan on 15m chart with 1H bias filter.
+        Full ICT setup scan on entry timeframe with 1H bias filter.
 
-        Priority:
+        Entry priority (displacement FVGs first, then OBs):
           1. Kill zone must be active
-          2. HTF bias from 1H structure
-          3. Recent FVG entry (highest priority — shows displacement)
-          4. Fallback: Order Block entry
+          2. HTF bias from 1H market structure
+          3. Displaced FVG — price inside lower 50% (OTE zone, deeper retracement)
+          4. Any FVG — price anywhere inside the gap
+          5. Order Block — price inside OB body range
 
-        Returns:
-          {'signal', 'entry', 'sl', 'tp', 'rr', 'reason', 'setup', 'kill_zone', 'htf_bias'}
+        All lookback windows auto-scaled to tf_minutes set at init.
         """
         base = {
             "signal":    "HOLD",
@@ -283,11 +306,11 @@ class ICTModel:
             "htf_bias":  None,
         }
 
-        if len(df_15m) < 25:
-            base["reason"] = "Insufficient 15m bars"
+        if len(df_entry) < self.min_bars:
+            base["reason"] = f"Insufficient bars ({len(df_entry)} < {self.min_bars})"
             return base
 
-        # ── Kill zone check ─────────────────────────────────────────────────
+        # ── Kill zone check ──────────────────────────────────────────────────
         kz = self.is_kill_zone(current_time_et)
         if not kz:
             now_str = (current_time_et or datetime.now(self.ET)).strftime("%H:%M ET")
@@ -296,101 +319,120 @@ class ICTModel:
 
         base["kill_zone"] = kz
 
-        # ── HTF bias ────────────────────────────────────────────────────────
+        # ── HTF bias ─────────────────────────────────────────────────────────
         htf_bias = self.get_htf_bias(df_1h)
         base["htf_bias"] = htf_bias
 
-        # ── 15m structure ───────────────────────────────────────────────────
-        structure, _ = self.detect_market_structure(df_15m)
+        # ── Entry timeframe structure ─────────────────────────────────────────
+        structure, _ = self.detect_market_structure(df_entry)
 
-        # ── FVGs — last 20 bars ─────────────────────────────────────────────
-        all_fvgs    = self.detect_fvg(df_15m)
-        recent_fvgs = [f for f in all_fvgs if f["idx"] > len(df_15m) - 20]
+        # ── FVGs — scaled recency window ──────────────────────────────────────
+        all_fvgs    = self.detect_fvg(df_entry)
+        recent_fvgs = [f for f in all_fvgs if f["idx"] > len(df_entry) - self.fvg_recency]
 
-        # ── OBs from last 5 structure events ───────────────────────────────
+        # Sort: displaced FVGs first, then by recency
+        recent_fvgs.sort(key=lambda x: (-int(x["displacement"]), -x["idx"]))
+
+        # ── OBs from last 5 structure events — scaled recency window ─────────
         recent_events = structure[-5:] if len(structure) >= 5 else structure
-        all_obs       = self.detect_order_blocks(df_15m, recent_events)
-        recent_obs    = [o for o in all_obs if o["idx"] > len(df_15m) - 30]
+        all_obs       = self.detect_order_blocks(df_entry, recent_events)
+        recent_obs    = [o for o in all_obs if o["idx"] > len(df_entry) - self.ob_recency]
 
-        current_price = float(df_15m["close"].iloc[-1])
+        current_price = float(df_entry["close"].iloc[-1])
 
-        # ── BULLISH setup ────────────────────────────────────────────────────
+        # ── BULLISH setups ────────────────────────────────────────────────────
         if htf_bias in ("bull", "neutral"):
-            # FVG entry
-            for fvg in sorted(recent_fvgs, key=lambda x: -x["idx"]):
-                if fvg["type"] == "BULL" and fvg["bottom"] <= current_price <= fvg["top"]:
-                    entry = current_price
-                    sl    = fvg["bottom"] * (1 - 0.001)   # 1 tick below FVG bottom
-                    risk  = entry - sl
-                    if risk <= 0:
-                        continue
-                    tp = entry + risk * self.rr_ratio
-                    return {**base,
-                        "signal": "BUY",
-                        "entry":  round(entry, 4),
-                        "sl":     round(sl, 4),
-                        "tp":     round(tp, 4),
-                        "rr":     self.rr_ratio,
-                        "setup":  "FVG",
-                        "reason": f"Bullish FVG [{fvg['bottom']:.2f}–{fvg['top']:.2f}] | {kz} | HTF:{htf_bias}",
-                    }
+            for fvg in recent_fvgs:
+                if fvg["type"] != "BULL":
+                    continue
+                # OTE: price must be in lower 50% of FVG (deeper retracement = better entry)
+                ote_top = fvg["mid"]
+                if not (fvg["bottom"] <= current_price <= ote_top):
+                    continue
+                entry = current_price
+                sl    = fvg["bottom"] * (1 - 0.001)
+                risk  = entry - sl
+                if risk <= 0:
+                    continue
+                tp   = entry + risk * self.rr_ratio
+                disp = " [DISP]" if fvg["displacement"] else ""
+                return {**base,
+                    "signal": "BUY",
+                    "entry":  round(entry, 4),
+                    "sl":     round(sl, 4),
+                    "tp":     round(tp, 4),
+                    "rr":     self.rr_ratio,
+                    "setup":  "FVG",
+                    "reason": f"Bullish FVG{disp} [{fvg['bottom']:.2f}–{fvg['top']:.2f}] OTE≤{ote_top:.2f} | {kz} | HTF:{htf_bias}",
+                }
 
-            # OB entry
             for ob in sorted(recent_obs, key=lambda x: -x["idx"]):
-                if ob["type"] == "BULL" and ob["bottom"] <= current_price <= ob["top"]:
-                    entry = current_price
-                    sl    = ob["low"] * (1 - 0.001)
-                    risk  = entry - sl
-                    if risk <= 0:
-                        continue
-                    tp = entry + risk * self.rr_ratio
-                    return {**base,
-                        "signal": "BUY",
-                        "entry":  round(entry, 4),
-                        "sl":     round(sl, 4),
-                        "tp":     round(tp, 4),
-                        "rr":     self.rr_ratio,
-                        "setup":  "OB",
-                        "reason": f"Bullish OB [{ob['bottom']:.2f}–{ob['top']:.2f}] | {kz} | HTF:{htf_bias}",
-                    }
+                if ob["type"] != "BULL":
+                    continue
+                if not (ob["bottom"] <= current_price <= ob["top"]):
+                    continue
+                entry = current_price
+                sl    = ob["low"] * (1 - 0.001)
+                risk  = entry - sl
+                if risk <= 0:
+                    continue
+                tp = entry + risk * self.rr_ratio
+                return {**base,
+                    "signal": "BUY",
+                    "entry":  round(entry, 4),
+                    "sl":     round(sl, 4),
+                    "tp":     round(tp, 4),
+                    "rr":     self.rr_ratio,
+                    "setup":  "OB",
+                    "reason": f"Bullish OB [{ob['bottom']:.2f}–{ob['top']:.2f}] | {kz} | HTF:{htf_bias}",
+                }
 
-        # ── BEARISH setup ────────────────────────────────────────────────────
+        # ── BEARISH setups ────────────────────────────────────────────────────
         if htf_bias in ("bear", "neutral"):
-            for fvg in sorted(recent_fvgs, key=lambda x: -x["idx"]):
-                if fvg["type"] == "BEAR" and fvg["bottom"] <= current_price <= fvg["top"]:
-                    entry = current_price
-                    sl    = fvg["top"] * (1 + 0.001)
-                    risk  = sl - entry
-                    if risk <= 0:
-                        continue
-                    tp = entry - risk * self.rr_ratio
-                    return {**base,
-                        "signal": "SELL",
-                        "entry":  round(entry, 4),
-                        "sl":     round(sl, 4),
-                        "tp":     round(tp, 4),
-                        "rr":     self.rr_ratio,
-                        "setup":  "FVG",
-                        "reason": f"Bearish FVG [{fvg['bottom']:.2f}–{fvg['top']:.2f}] | {kz} | HTF:{htf_bias}",
-                    }
+            for fvg in recent_fvgs:
+                if fvg["type"] != "BEAR":
+                    continue
+                # OTE: price must be in upper 50% of FVG (shallower = deeper retracement up)
+                ote_bottom = fvg["mid"]
+                if not (ote_bottom <= current_price <= fvg["top"]):
+                    continue
+                entry = current_price
+                sl    = fvg["top"] * (1 + 0.001)
+                risk  = sl - entry
+                if risk <= 0:
+                    continue
+                tp   = entry - risk * self.rr_ratio
+                disp = " [DISP]" if fvg["displacement"] else ""
+                return {**base,
+                    "signal": "SELL",
+                    "entry":  round(entry, 4),
+                    "sl":     round(sl, 4),
+                    "tp":     round(tp, 4),
+                    "rr":     self.rr_ratio,
+                    "setup":  "FVG",
+                    "reason": f"Bearish FVG{disp} [{fvg['bottom']:.2f}–{fvg['top']:.2f}] OTE≥{ote_bottom:.2f} | {kz} | HTF:{htf_bias}",
+                }
 
             for ob in sorted(recent_obs, key=lambda x: -x["idx"]):
-                if ob["type"] == "BEAR" and ob["bottom"] <= current_price <= ob["top"]:
-                    entry = current_price
-                    sl    = ob["high"] * (1 + 0.001)
-                    risk  = sl - entry
-                    if risk <= 0:
-                        continue
-                    tp = entry - risk * self.rr_ratio
-                    return {**base,
-                        "signal": "SELL",
-                        "entry":  round(entry, 4),
-                        "sl":     round(sl, 4),
-                        "tp":     round(tp, 4),
-                        "rr":     self.rr_ratio,
-                        "setup":  "OB",
-                        "reason": f"Bearish OB [{ob['bottom']:.2f}–{ob['top']:.2f}] | {kz} | HTF:{htf_bias}",
-                    }
+                if ob["type"] != "BEAR":
+                    continue
+                if not (ob["bottom"] <= current_price <= ob["top"]):
+                    continue
+                entry = current_price
+                sl    = ob["high"] * (1 + 0.001)
+                risk  = sl - entry
+                if risk <= 0:
+                    continue
+                tp = entry - risk * self.rr_ratio
+                return {**base,
+                    "signal": "SELL",
+                    "entry":  round(entry, 4),
+                    "sl":     round(sl, 4),
+                    "tp":     round(tp, 4),
+                    "rr":     self.rr_ratio,
+                    "setup":  "OB",
+                    "reason": f"Bearish OB [{ob['bottom']:.2f}–{ob['top']:.2f}] | {kz} | HTF:{htf_bias}",
+                }
 
         base["reason"] = f"No ICT setup in {kz} kill zone | HTF:{htf_bias}"
         return base
@@ -403,32 +445,32 @@ class ICTModel:
 if __name__ == "__main__":
     import yfinance as yf
 
-    print("Fetching SPY data...")
-    df_15m = yf.download("SPY", period="5d", interval="15m", progress=False)
-    df_1h  = yf.download("SPY", period="60d", interval="1h", progress=False)
+    print("Fetching SPY 5m + 1H data...")
+    df_5m = yf.download("SPY", period="5d", interval="5m", progress=False)
+    df_1h = yf.download("SPY", period="60d", interval="1h", progress=False)
 
-    for df in (df_15m, df_1h):
+    for df in (df_5m, df_1h):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df.columns = [str(c).lower() for c in df.columns]
 
-    model = ICTModel()
+    model = ICTModel(tf_minutes=5)
 
-    # Smoke test structure detection
-    events, trend = model.detect_market_structure(df_15m)
-    fvgs          = model.detect_fvg(df_15m)
-    obs           = model.detect_order_blocks(df_15m, events[-5:])
+    events, trend = model.detect_market_structure(df_5m)
+    fvgs          = model.detect_fvg(df_5m)
+    obs           = model.detect_order_blocks(df_5m, events[-5:])
+    displaced     = sum(1 for f in fvgs if f["displacement"])
 
-    print(f"\n=== ICT Model Smoke Test ===")
-    print(f"15m bars: {len(df_15m)} | 1H bars: {len(df_1h)}")
+    print(f"\n=== ICT Model Smoke Test (5m) ===")
+    print(f"5m bars: {len(df_5m)} | 1H bars: {len(df_1h)}")
+    print(f"swing_lookback={model.swing_lookback} fvg_recency={model.fvg_recency} ob_recency={model.ob_recency}")
     print(f"HTF bias:  {model.get_htf_bias(df_1h)}")
     print(f"Structure events (last 5): {events[-5:]}")
-    print(f"FVGs detected: {len(fvgs)} | Recent (last 20 bars): {sum(1 for f in fvgs if f['idx'] > len(df_15m)-20)}")
+    print(f"FVGs: {len(fvgs)} total | {displaced} with displacement | Recent: {sum(1 for f in fvgs if f['idx'] > len(df_5m)-model.fvg_recency)}")
     print(f"Order blocks: {len(obs)}")
     print(f"Kill zone now: {model.is_kill_zone()}")
 
-    # Force signal check with current time
-    signal = model.get_signal(df_15m, df_1h)
+    signal = model.get_signal(df_5m, df_1h)
     print(f"\nSignal: {signal['signal']}")
     print(f"Reason: {signal['reason']}")
     if signal["signal"] != "HOLD":
