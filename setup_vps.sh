@@ -88,10 +88,10 @@ CRON_BLOCK="$CRON_MARKER
 # London kill zone — 3-5 AM ET (7-10 AM UTC covers EDT+EST)
 */5 7,8,9 * * 1-5 $APP_DIR/ict_cron.sh >> $LOG_DIR/ict.log 2>&1
 0 10 * * 1-5 $APP_DIR/ict_cron.sh >> $LOG_DIR/ict.log 2>&1
-# NY AM kill zone — 7:30-10 AM ET (11:30 AM-3 PM UTC covers EDT+EST)
-30,35,40,45,50,55 11 * * 1-5 $APP_DIR/ict_cron.sh >> $LOG_DIR/ict.log 2>&1
-*/5 12,13,14 * * 1-5 $APP_DIR/ict_cron.sh >> $LOG_DIR/ict.log 2>&1
-0 15 * * 1-5 $APP_DIR/ict_cron.sh >> $LOG_DIR/ict.log 2>&1
+# NY AM kill zone — 8:30-11 AM ET (12:30-15 UTC EDT / 13:30-16 UTC EST)
+30,35,40,45,50,55 12 * * 1-5 $APP_DIR/ict_cron.sh >> $LOG_DIR/ict.log 2>&1
+*/5 13,14 * * 1-5 $APP_DIR/ict_cron.sh >> $LOG_DIR/ict.log 2>&1
+0,5,10,15,20,25,30 15 * * 1-5 $APP_DIR/ict_cron.sh >> $LOG_DIR/ict.log 2>&1
 # Silver Bullet — 1:30-4 PM ET (17:30-20 UTC EDT / 18:30-21 UTC EST)
 30,35,40,45,50,55 17 * * 1-5 $APP_DIR/ict_cron.sh >> $LOG_DIR/ict.log 2>&1
 */5 18,19 * * 1-5 $APP_DIR/ict_cron.sh >> $LOG_DIR/ict.log 2>&1

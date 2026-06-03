@@ -28,9 +28,9 @@ class ICTModel:
 
     KILL_ZONES = {
         "london":        (time(3, 0),  time(5, 0)),
-        "new_york":      (time(7, 30), time(10, 0)),
+        "new_york":      (time(8, 30), time(11, 0)),    # shifted from 7:30 — avoids pre-market chop
         "london_close":  (time(10, 0), time(12, 0)),
-        "silver_bullet": (time(13, 30), time(16, 0)),   # NY PM — trend continuation
+        "silver_bullet": (time(13, 30), time(16, 0)),
     }
 
     # News blackout windows (ET) — no entries ±5 min around high-impact releases
@@ -413,6 +413,75 @@ class ICTModel:
         return None
 
     # ──────────────────────────────────────────────────────────────────────────
+    # ACCUMULATION BOX  (session range formed before manipulation)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    # Accumulation windows to look back into — keyed by session
+    ACCUM_WINDOWS = {
+        "london":        (time(0,  0), time(2,  0)),
+        "new_york":      (time(7, 30), time(8, 30)),
+        "silver_bullet": (time(13, 0), time(13, 30)),
+    }
+
+    def get_accumulation_box(
+        self,
+        df: pd.DataFrame,
+        dt_et: Optional[datetime] = None,
+    ) -> tuple[Optional[float], Optional[float]]:
+        """
+        Return (accum_high, accum_low) — the range built during the
+        accumulation phase of the current session.
+        Used by the AMD filter to decide whether today is a reversal or trend day.
+        """
+        if dt_et is None:
+            dt_et = datetime.now(self.ET)
+
+        # Find the most recently completed accumulation window
+        t = dt_et.time()
+        window = None
+        for sess, (start, end) in self.ACCUM_WINDOWS.items():
+            if t >= start:
+                window = (start, end)   # last applicable window
+        if window is None:
+            return None, None
+
+        try:
+            idx = df.index
+            if idx.tz is None:
+                idx = idx.tz_localize("UTC")
+            idx_et = idx.tz_convert(self.ET)
+            today  = dt_et.date()
+            mask   = (
+                (idx_et.date == today) &
+                (pd.Series(idx_et.time, index=df.index) >= window[0]) &
+                (pd.Series(idx_et.time, index=df.index) <  window[1])
+            )
+            bars = df[mask]
+            if len(bars) == 0:
+                return None, None
+            return float(bars["high"].max()), float(bars["low"].min())
+        except Exception:
+            return None, None
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # UNICORN SETUP  (FVG inside Order Block — highest-confluence array)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def detect_unicorn(self, fvg: dict, obs: list[dict]) -> bool:
+        """
+        True if the FVG overlaps with an active Order Block of the same direction.
+        FVG inside OB = Unicorn Setup — highest-probability confluence entry.
+        """
+        for ob in obs:
+            if ob["type"] != fvg["type"]:
+                continue
+            overlap_top = min(fvg["top"], ob["top"])
+            overlap_bot = max(fvg["bottom"], ob["bottom"])
+            if overlap_top > overlap_bot:   # genuine price overlap
+                return True
+        return False
+
+    # ──────────────────────────────────────────────────────────────────────────
     # JUDAS SWING DETECTION
     # ──────────────────────────────────────────────────────────────────────────
 
@@ -588,16 +657,30 @@ class ICTModel:
             base["reason"] = f"AMD accumulation — marking range, no entries"
             return base
 
-        # ── SMT divergence + Judas Swing ─────────────────────────────────────
+        # ── SMT divergence + Judas Swing / Trend Day ─────────────────────────
         smt       = self.detect_smt(df_entry, df_correlated)
         judas     = self.detect_judas_swing(df_entry, df_correlated, current_time_et)
         smt_tag   = f" SMT:{smt}" if smt else ""
         judas_tag = f" JUDAS:{judas}" if judas else ""
 
-        # Manipulation phase: only enter on confirmed Judas Swing reversal
-        if amd_phase == "manipulation" and not judas:
-            base["reason"] = f"AMD manipulation — waiting for Judas Swing sweep+reversal{smt_tag}"
-            return base
+        if amd_phase == "manipulation":
+            accum_high, accum_low = self.get_accumulation_box(df_entry, current_time_et)
+            if accum_high and accum_low:
+                price_inside_box = accum_low <= current_price <= accum_high
+                if price_inside_box and not judas:
+                    # Price still inside accumulation range — need sweep + reversal
+                    base["reason"] = (
+                        f"AMD manipulation — price in accum box [{accum_low:.2f}–{accum_high:.2f}],"
+                        f" waiting for Judas Swing{smt_tag}"
+                    )
+                    return base
+                # Price broke OUT of accum box → trend day, bypass Judas requirement
+                if not price_inside_box:
+                    judas_tag = " [TREND_DAY]"
+            elif not judas:
+                # No accum data — fall back to standard Judas requirement
+                base["reason"] = f"AMD manipulation — no accum data, waiting for Judas Swing{smt_tag}"
+                return base
 
         # ── Midnight open premium/discount filter ─────────────────────────────
         midnight_open = self.get_midnight_open(df_entry)
@@ -645,25 +728,25 @@ class ICTModel:
             for fvg in recent_fvgs:
                 if fvg["type"] != "BULL":
                     continue
-                # OTE: price must be in lower 50% of FVG (deeper retracement = better entry)
                 ote_top = fvg["mid"]
                 if not (fvg["bottom"] <= current_price <= ote_top):
                     continue
-                entry = current_price
-                sl    = fvg["bottom"] * (1 - 0.001)
-                risk  = entry - sl
+                entry    = current_price
+                sl       = fvg["bottom"] * (1 - 0.001)
+                risk     = entry - sl
                 if risk <= 0:
                     continue
-                tp   = entry + risk * self.rr_ratio
-                disp = " [DISP]" if fvg["displacement"] else ""
+                tp       = entry + risk * self.rr_ratio
+                disp     = " [DISP]" if fvg["displacement"] else ""
+                unicorn  = " [UNICORN]" if self.detect_unicorn(fvg, recent_obs) else ""
                 return {**base,
                     "signal": "BUY",
                     "entry":  round(entry, 4),
                     "sl":     round(sl, 4),
                     "tp":     round(tp, 4),
                     "rr":     self.rr_ratio,
-                    "setup":  "FVG",
-                    "reason": f"Bullish FVG{disp} [{fvg['bottom']:.2f}–{fvg['top']:.2f}] OTE≤{ote_top:.2f} | {kz} | HTF:{htf_bias}{smt_tag}{judas_tag}",
+                    "setup":  "FVG" + unicorn.strip(),
+                    "reason": f"Bullish FVG{disp}{unicorn} [{fvg['bottom']:.2f}–{fvg['top']:.2f}] OTE≤{ote_top:.2f} | {kz} | HTF:{htf_bias}{smt_tag}{judas_tag}",
                 }
 
             for ob in sorted(recent_obs, key=lambda x: -x["idx"]):
@@ -695,21 +778,22 @@ class ICTModel:
                 ote_bottom = fvg["mid"]
                 if not (ote_bottom <= current_price <= fvg["top"]):
                     continue
-                entry = current_price
-                sl    = fvg["top"] * (1 + 0.001)
-                risk  = sl - entry
+                entry   = current_price
+                sl      = fvg["top"] * (1 + 0.001)
+                risk    = sl - entry
                 if risk <= 0:
                     continue
-                tp   = entry - risk * self.rr_ratio
-                disp = " [DISP]" if fvg["displacement"] else ""
+                tp      = entry - risk * self.rr_ratio
+                disp    = " [DISP]" if fvg["displacement"] else ""
+                unicorn = " [UNICORN]" if self.detect_unicorn(fvg, recent_obs) else ""
                 return {**base,
                     "signal": "SELL",
                     "entry":  round(entry, 4),
                     "sl":     round(sl, 4),
                     "tp":     round(tp, 4),
                     "rr":     self.rr_ratio,
-                    "setup":  "FVG",
-                    "reason": f"Bearish FVG{disp} [{fvg['bottom']:.2f}–{fvg['top']:.2f}] OTE≥{ote_bottom:.2f} | {kz} | HTF:{htf_bias}{smt_tag}{judas_tag}",
+                    "setup":  "FVG" + unicorn.strip(),
+                    "reason": f"Bearish FVG{disp}{unicorn} [{fvg['bottom']:.2f}–{fvg['top']:.2f}] OTE≥{ote_bottom:.2f} | {kz} | HTF:{htf_bias}{smt_tag}{judas_tag}",
                 }
 
             for ob in sorted(recent_obs, key=lambda x: -x["idx"]):

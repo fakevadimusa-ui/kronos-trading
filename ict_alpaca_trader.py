@@ -88,7 +88,7 @@ CORR_SYMBOL = "QQQ"   # NQ proxy for SMT divergence
 # Hard time cutoffs — force-close any open ICT position at session end
 SESSION_CUTOFFS_ET = {
     "london":        time(5,  0),
-    "new_york":      time(11, 30),
+    "new_york":      time(11, 0),    # aligned with new 8:30-11am window
     "london_close":  time(12, 0),
     "silver_bullet": time(16, 0),
 }
