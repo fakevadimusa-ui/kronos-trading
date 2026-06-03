@@ -1,8 +1,14 @@
 """
-ICT Alpaca Trader — SPY/QQQ Intraday
-=====================================
-Runs the ICT model on 15-minute SPY data during kill zones and
-executes market orders via Alpaca (paper → live → prop firm).
+ICT Alpaca Trader — ES1! Signal / SPY Execution
+=================================================
+Runs the ICT model on 15-minute ES1! futures data (from TradingView Desktop)
+during kill zones and executes market orders on SPY via Alpaca (paper → live → prop firm).
+
+Data source priority:
+  1. TradingView Desktop (CDP at localhost:9222) — ES1! futures (authentic ICT instrument)
+  2. Fallback: yfinance SPY — used when TradingView is not running
+
+SL/TP translation: ES1! risk % → SPY bracket prices via Alpaca last trade price.
 
 Schedule (cron, PT weekdays):
   */15 0,1    * * 1-5   # London kill zone  (3–5 AM ET = 12–2 AM PT)
@@ -20,8 +26,11 @@ Risk rules:
   - Total DD halt: −8%
 """
 
+from __future__ import annotations
+
 import json
 import os
+import subprocess
 import sys
 import warnings
 from datetime import datetime, timezone, timedelta
@@ -39,6 +48,7 @@ from alpaca.trading.requests import (
     MarketOrderRequest,
     TakeProfitRequest,
     StopLossRequest,
+    GetPortfolioHistoryRequest,
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
@@ -50,9 +60,11 @@ from ict_model import ICTModel
 # ══════════════════════════════════════════════════════════════════════════════
 
 CONFIG_PATH   = Path.home() / "freqtrade/user_data/config_kronos_nvda.json"
+TV_FETCH      = Path.home() / "tradingview-mcp/tv_fetch.js"
 
-SYMBOL        = "SPY"      # primary instrument
-SYMBOL_ALT    = "QQQ"      # alternate — switch here to trade tech/NQ equivalent
+SIGNAL_SYMBOL = "CME_MINI_DL:ES1!"   # ICT analysis instrument (TradingView)
+SYMBOL        = "SPY"                  # Alpaca execution instrument
+SYMBOL_ALT    = "QQQ"                  # alternate execution (tech/NQ equivalent)
 YF_PERIOD_15M = "5d"
 YF_PERIOD_1H  = "60d"
 
@@ -101,23 +113,105 @@ def load_credentials() -> tuple[str, str]:
 
 STATE_PATH = Path.home() / "freqtrade/user_data/logs/ict_state.json"
 
-def fetch_data(symbol: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Returns (df_15m, df_1h) with lowercase OHLCV columns."""
-    log(f"Fetching {symbol} 15m + 1H data...")
 
-    df_15m = yf.download(symbol, period=YF_PERIOD_15M, interval="15m",
-                         auto_adjust=True, progress=False)
-    df_1h  = yf.download(symbol, period=YF_PERIOD_1H,  interval="1h",
-                         auto_adjust=True, progress=False)
+def _tv_fetch_bars(tf: str, count: int) -> pd.DataFrame | None:
+    """
+    Call tv_fetch.js to get OHLCV bars for SIGNAL_SYMBOL at the given timeframe.
+    Returns a DataFrame with lowercase columns and UTC DatetimeIndex, or None on failure.
+    """
+    if not TV_FETCH.exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["node", str(TV_FETCH), "--symbol", SIGNAL_SYMBOL, "--tf", tf, "--count", str(count)],
+            capture_output=True, text=True, timeout=45,
+            cwd=str(TV_FETCH.parent),
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            log(f"[WARN] tv_fetch.js ({tf}m) exit={result.returncode}: {result.stderr.strip()[:200]}")
+            return None
+        data = json.loads(result.stdout.strip())
+        if not data.get("success") or not data.get("bars"):
+            log(f"[WARN] tv_fetch.js ({tf}m) returned: {data.get('error', 'no bars')}")
+            return None
+        df = pd.DataFrame(data["bars"])
+        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+        df = df.set_index("time").sort_index()
+        df.columns = [c.lower() for c in df.columns]
+        df.dropna(inplace=True)
+        return df
+    except Exception as e:
+        log(f"[WARN] tv_fetch.js ({tf}m) exception: {e}")
+        return None
 
+
+def fetch_data() -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    """
+    Returns (df_15m, df_1h, data_source).
+    Tries TradingView ES1! first; falls back to yfinance SPY.
+    """
+    log(f"Fetching data — primary: TradingView {SIGNAL_SYMBOL}, fallback: yfinance {SYMBOL}")
+
+    df_15m = _tv_fetch_bars("15", 200)
+    df_1h  = _tv_fetch_bars("60", 100)
+
+    if df_15m is not None and df_1h is not None and len(df_15m) >= 25:
+        log(f"[DATA] TradingView {SIGNAL_SYMBOL} | 15m: {len(df_15m)} bars | 1H: {len(df_1h)} bars | last: {df_15m['close'].iloc[-1]:.2f}")
+        return df_15m, df_1h, "tradingview"
+
+    log(f"[DATA] TradingView unavailable — falling back to yfinance {SYMBOL}")
+    df_15m = yf.download(SYMBOL, period=YF_PERIOD_15M, interval="15m",
+                         auto_adjust=True, progress=False)
+    df_1h  = yf.download(SYMBOL, period=YF_PERIOD_1H,  interval="1h",
+                         auto_adjust=True, progress=False)
     for df in (df_15m, df_1h):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df.columns = [str(c).lower() for c in df.columns]
         df.dropna(inplace=True)
+    log(f"[DATA] yfinance {SYMBOL} | 15m: {len(df_15m)} bars | 1H: {len(df_1h)} bars | last: {df_15m['close'].iloc[-1]:.2f}")
+    return df_15m, df_1h, "yfinance"
 
-    log(f"15m bars: {len(df_15m)} | 1H bars: {len(df_1h)} | last close: {df_15m['close'].iloc[-1]:.2f}")
-    return df_15m, df_1h
+
+def translate_signal_to_spy(signal: dict, client) -> dict:
+    """
+    Convert ES1! entry/sl/tp prices to SPY prices for Alpaca bracket orders.
+    Preserves the risk % from the ES1! ICT setup; applies it to the current SPY price.
+    """
+    if signal["signal"] == "HOLD":
+        return signal
+
+    es1_entry = signal["entry"]
+    es1_sl    = signal["sl"]
+    risk_pct  = abs(es1_entry - es1_sl) / es1_entry  # e.g. 0.0036 for 0.36%
+
+    # Get current SPY price from Alpaca last trade
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockLatestTradeRequest
+        key, secret = load_credentials()
+        data_client = StockHistoricalDataClient(key, secret)
+        resp = data_client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=SYMBOL))
+        spy_price = float(resp[SYMBOL].price)
+    except Exception:
+        # Fallback: last close from quick yfinance 1m pull
+        spy_df = yf.download(SYMBOL, period="1d", interval="1m", progress=False, auto_adjust=True)
+        spy_price = float(spy_df["Close"].iloc[-1])
+
+    rr = signal["rr"]
+    if signal["signal"] == "BUY":
+        spy_sl = round(spy_price * (1 - risk_pct), 2)
+        spy_tp = round(spy_price + (spy_price - spy_sl) * rr, 2)
+    else:  # SELL
+        spy_sl = round(spy_price * (1 + risk_pct), 2)
+        spy_tp = round(spy_price - (spy_sl - spy_price) * rr, 2)
+
+    translated = {**signal}
+    translated["entry"]  = round(spy_price, 2)
+    translated["sl"]     = spy_sl
+    translated["tp"]     = spy_tp
+    translated["reason"] = f"[ES1!→SPY] {signal['reason']} | ES1!={es1_entry:.2f} risk={risk_pct:.3%}"
+    return translated
 
 
 def save_state(signal: dict, shares: int) -> None:
@@ -170,14 +264,17 @@ def check_daily_dd(client: TradingClient) -> float:
 
 
 def check_total_dd(client: TradingClient) -> float:
-    """Returns drawdown % from all-time equity peak."""
+    """
+    Returns drawdown % from all-time equity peak.
+    Uses live equity (includes intraday unrealized P&L) vs history snapshots for peak.
+    """
     try:
-        hist = client.get_portfolio_history(period="all")
-        eq_list = [e for e in hist.equity if e is not None]
+        hist    = client.get_portfolio_history(GetPortfolioHistoryRequest(period="1A"))
+        eq_list = [e for e in hist.equity if e is not None and e > 0]
         if not eq_list:
             return 0.0
         peak    = max(eq_list)
-        current = eq_list[-1]
+        current = get_account_equity(client)   # live, includes unrealized P&L
         return (current - peak) / peak if peak > 0 else 0.0
     except Exception as e:
         log(f"[WARN] Could not fetch portfolio history: {e}")
@@ -318,8 +415,12 @@ def main() -> None:
         return
 
     # ── ICT signal generation ───────────────────────────────────────────────
-    df_15m, df_1h = fetch_data(SYMBOL)
+    df_15m, df_1h, data_source = fetch_data()
     signal = model.get_signal(df_15m, df_1h)
+
+    # Translate ES1! price levels → SPY prices when TradingView data was used
+    if data_source == "tradingview" and signal["signal"] != "HOLD":
+        signal = translate_signal_to_spy(signal, client)
 
     log(f"Signal: {signal['signal']} | {signal['reason']}")
 
