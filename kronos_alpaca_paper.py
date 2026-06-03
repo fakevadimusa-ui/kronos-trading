@@ -275,9 +275,12 @@ def main() -> None:
         )
         return
 
-    risk_dollars = equity * RISK_PER_TRADE
-    shares       = max(1, int(risk_dollars / (close * SL_PCT)))
-    log(f"Position size: {shares} shares (risk ${risk_dollars:.0f})")
+    risk_dollars  = equity * RISK_PER_TRADE
+    buying_power  = float(account.buying_power)
+    shares        = max(1, int(risk_dollars / (close * SL_PCT)))
+    max_by_bp     = int(buying_power * 0.95 / close)
+    shares        = min(shares, max_by_bp)
+    log(f"Position size: {shares} shares (risk ${risk_dollars:.0f}, buying power ${buying_power:,.0f})")
 
     sl_price, tp_price = place_bracket_order(client, side, shares, close)
 

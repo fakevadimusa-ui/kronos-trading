@@ -276,17 +276,20 @@ def main() -> None:
         return
 
     risk_dollars = equity * RISK_PER_TRADE
+    buying_power = float(account.buying_power)
 
     if direction == "LONG":
         exec_sym   = EXEC_SYMBOL
         exec_price = fetch_exec_price(EXEC_SYMBOL)
         shares     = max(1, int(risk_dollars / (exec_price * SL_PCT)))
-        log(f"Long crude → buying {shares}x {exec_sym} (risk ${risk_dollars:.0f})")
+        shares     = min(shares, int(buying_power * 0.95 / exec_price))
+        log(f"Long crude → buying {shares}x {exec_sym} (risk ${risk_dollars:.0f}, buying power ${buying_power:,.0f})")
     else:
         exec_sym   = EXEC_SYMBOL_INV
         exec_price = fetch_exec_price(EXEC_SYMBOL_INV)
         shares     = max(1, int((risk_dollars / (exec_price * SL_PCT)) / 2))
-        log(f"Short crude → buying {shares}x {exec_sym} (2x inverse, risk ${risk_dollars:.0f})")
+        shares     = min(shares, int(buying_power * 0.95 / exec_price))
+        log(f"Short crude → buying {shares}x {exec_sym} (2x inverse, risk ${risk_dollars:.0f}, buying power ${buying_power:,.0f})")
 
     sl_price, tp_price = place_bracket_order(client, exec_sym, shares, exec_price)
 
