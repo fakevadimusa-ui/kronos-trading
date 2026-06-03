@@ -27,10 +27,18 @@ class ICTModel:
     ET = pytz.timezone("America/New_York")
 
     KILL_ZONES = {
-        "london":       (time(3, 0),  time(5, 0)),
-        "new_york":     (time(7, 30), time(10, 0)),
-        "london_close": (time(10, 0), time(12, 0)),
+        "london":        (time(3, 0),  time(5, 0)),
+        "new_york":      (time(7, 30), time(10, 0)),
+        "london_close":  (time(10, 0), time(12, 0)),
+        "silver_bullet": (time(13, 30), time(16, 0)),   # NY PM — trend continuation
     }
+
+    # News blackout windows (ET) — no entries ±5 min around high-impact releases
+    NEWS_BLACKOUTS = [
+        (time(8, 25),  time(8, 35)),    # 8:30 ET: NFP, CPI, PPI, Jobless Claims
+        (time(9, 25),  time(9, 35)),    # 9:30 ET: NY equities open
+        (time(13, 55), time(14, 5)),    # 2:00 ET: FOMC (8×/year, static blackout)
+    ]
 
     def __init__(
         self,
@@ -261,6 +269,16 @@ class ICTModel:
                 return name
         return None
 
+    def is_news_blackout(self, dt_et: Optional[datetime] = None) -> bool:
+        """True if within ±5 min of a high-impact news event — no new entries."""
+        if dt_et is None:
+            dt_et = datetime.now(self.ET)
+        t = dt_et.time()
+        for start, end in self.NEWS_BLACKOUTS:
+            if start <= t <= end:
+                return True
+        return False
+
     # ──────────────────────────────────────────────────────────────────────────
     # HTF BIAS
     # ──────────────────────────────────────────────────────────────────────────
@@ -315,6 +333,12 @@ class ICTModel:
         if not kz:
             now_str = (current_time_et or datetime.now(self.ET)).strftime("%H:%M ET")
             base["reason"] = f"Not in kill zone ({now_str})"
+            return base
+
+        # ── News blackout check ──────────────────────────────────────────────
+        if self.is_news_blackout(current_time_et):
+            now_str = (current_time_et or datetime.now(self.ET)).strftime("%H:%M ET")
+            base["reason"] = f"News blackout ({now_str}) — no entries ±5 min of high-impact event"
             return base
 
         base["kill_zone"] = kz

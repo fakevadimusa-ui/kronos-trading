@@ -76,10 +76,11 @@ SYMBOL_ALT    = "QQQ"                  # alternate execution (tech/NQ equivalent
 YF_PERIOD_15M = "5d"
 YF_PERIOD_1H  = "60d"
 
-RISK_PER_TRADE       = 0.01    # 1% of account
-RISK_PER_TRADE_SMALL = 0.005   # reduced when DD > 4%
+RISK_PER_TRADE       = 0.005   # 0.5% per trade — prop firm safe
+RISK_PER_TRADE_SMALL = 0.0025  # 0.25% when DD > 2%
 DAILY_DD_LIMIT       = -0.04
 TOTAL_DD_LIMIT       = -0.08
+DAILY_LOSS_LIMIT     = 2       # halt after 2 losses in one day
 
 ICT_TAG = "ICT"   # order tag to identify our positions vs Kronos positions
 
@@ -327,6 +328,28 @@ def check_daily_dd(client: TradingClient) -> float:
     return (eq - prev) / prev if prev > 0 else 0.0
 
 
+def count_daily_losses(client: TradingClient) -> int:
+    """Count stop-loss hits on SYMBOL today — each is one loss toward DAILY_LOSS_LIMIT."""
+    try:
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+        today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        orders = client.get_orders(GetOrdersRequest(
+            status=QueryOrderStatus.CLOSED,
+            after=today,
+            symbols=[SYMBOL],
+            limit=50,
+        ))
+        return sum(
+            1 for o in orders
+            if str(getattr(o, "type", "")).lower() in ("stop", "stop_limit")
+            and str(getattr(o, "status", "")).lower() == "filled"
+        )
+    except Exception as e:
+        log(f"[WARN] Could not count daily losses: {e}")
+        return 0
+
+
 def check_total_dd(client: TradingClient) -> float:
     """
     Returns drawdown % from all-time equity peak.
@@ -453,7 +476,8 @@ def main() -> None:
     total_dd = check_total_dd(client)
     equity   = get_account_equity(client)
 
-    log(f"Equity: ${equity:,.2f} | Daily DD: {daily_dd:.2%} | Total DD: {total_dd:.2%}")
+    daily_losses = count_daily_losses(client)
+    log(f"Equity: ${equity:,.2f} | Daily DD: {daily_dd:.2%} | Total DD: {total_dd:.2%} | Losses today: {daily_losses}/{DAILY_LOSS_LIMIT}")
 
     if daily_dd <= DAILY_DD_LIMIT:
         log(f"[HALT] Daily DD {daily_dd:.2%} breaches limit {DAILY_DD_LIMIT:.0%}. No trade.")
@@ -463,6 +487,11 @@ def main() -> None:
     if total_dd <= TOTAL_DD_LIMIT:
         log(f"[HALT] Total DD {total_dd:.2%} breaches limit {TOTAL_DD_LIMIT:.0%}. No trade.")
         send_telegram(f"⛔ ICT HALT: Total DD {total_dd:.2%}")
+        return
+
+    if daily_losses >= DAILY_LOSS_LIMIT:
+        log(f"[HALT] {daily_losses} losses today — 2-loss daily rule. Done for the day.")
+        send_telegram(f"⛔ ICT HALT: {daily_losses} losses today — terminal closed")
         return
 
     # Reduce risk if halfway to daily limit
