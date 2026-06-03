@@ -459,7 +459,11 @@ class ICTModel:
             bars = df[mask]
             if len(bars) == 0:
                 return None, None
-            return float(bars["high"].max()), float(bars["low"].min())
+            # Use 95th/5th percentile to exclude wick spikes from redefining the box
+            return (
+                float(np.percentile(bars["high"].values, 95)),
+                float(np.percentile(bars["low"].values,  5)),
+            )
         except Exception:
             return None, None
 
