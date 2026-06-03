@@ -1,0 +1,52 @@
+name: ICT Trading Bot
+
+# Kill zone schedule (UTC — covers both EDT and EST):
+#   London KZ:  3–5 AM ET  →  07:00–09:00 UTC (summer) / 08:00–10:00 UTC (winter)
+#   NY AM KZ:   7:30–10 AM ET → 11:30–14:00 UTC (summer) / 12:30–15:00 UTC (winter)
+#
+# We cover both seasons by running 07–10 UTC and 11–15 UTC every 15 min.
+# The ict_model.py kill-zone check handles exact timing — off-window runs exit in <5s.
+#
+# Free tier budget: ~560 runs/month × ~1 min = ~560 min (well under 2,000 limit).
+
+on:
+  schedule:
+    # London kill zone window (covers EDT + EST)
+    - cron: '0,15,30,45 7,8,9 * * 1-5'
+    # NY kill zone window (covers EDT + EST)
+    - cron: '0,15,30,45 11,12,13,14 * * 1-5'
+    # End-of-NY-session tick
+    - cron: '0 15 * * 1-5'
+  workflow_dispatch:   # manual trigger for testing
+
+jobs:
+  ict:
+    name: ICT Signal + Execute
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-ict-pip-${{ hashFiles('ict_requirements.txt') }}
+
+      - name: Install ICT dependencies
+        run: pip install -r ict_requirements.txt
+
+      - name: Run ICT trader
+        env:
+          ALPACA_KEY:      ${{ secrets.ALPACA_KEY }}
+          ALPACA_SECRET:   ${{ secrets.ALPACA_SECRET }}
+          TELEGRAM_TOKEN:  ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python ict_alpaca_trader.py
+        continue-on-error: true
