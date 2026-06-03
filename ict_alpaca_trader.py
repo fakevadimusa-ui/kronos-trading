@@ -95,9 +95,13 @@ SESSION_CUTOFFS_ET = {
     "london_close":  time(12, 0),
     "silver_bullet": time(16, 0),
 }
-STAGNATION_BARS = 12   # 60 min at 5m — close flat/losing position
+STAGNATION_BARS  = 12     # 60 min at 5m — close flat/losing position
+MAX_ENTRY_DRIFT  = 0.0015  # 0.15% — skip trade if price drifted too far from FVG entry
 
 ICT_TAG = "ICT"   # order tag to identify our positions vs Kronos positions
+
+# Session state — persists within a trading day, resets at midnight
+SESSION_STATE_PATH = Path.home() / "freqtrade/user_data/logs/ict_session.json"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -354,6 +358,54 @@ def clear_state() -> None:
         log("[STATE] Cleared")
 
 
+# ── Session state (resets daily, persists within a session) ──────────────────
+
+def _load_session() -> dict:
+    try:
+        if SESSION_STATE_PATH.exists():
+            with open(SESSION_STATE_PATH) as f:
+                s = json.load(f)
+            if s.get("date") == datetime.now().date().isoformat():
+                return s
+    except Exception:
+        pass
+    return {}
+
+
+def _save_session(s: dict) -> None:
+    s["date"] = datetime.now().date().isoformat()
+    SESSION_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(SESSION_STATE_PATH, "w") as f:
+        json.dump(s, f, indent=2)
+
+
+def get_ict_session_start_equity(client: TradingClient) -> float:
+    """
+    Return today's ICT-isolated starting equity.
+    First call of the day records current equity as baseline so Kronos
+    losses from other sessions don't contaminate ICT's daily loss count.
+    """
+    s = _load_session()
+    if "ict_start_equity" in s:
+        return float(s["ict_start_equity"])
+    eq = get_account_equity(client)
+    s["ict_start_equity"] = eq
+    _save_session(s)
+    return eq
+
+
+def get_trend_day_bypass(kill_zone: str) -> bool:
+    """Return True if trend day bypass was already triggered this session."""
+    return bool(_load_session().get(f"trend_bypass_{kill_zone}", False))
+
+
+def set_trend_day_bypass(kill_zone: str) -> None:
+    """Persist trend day bypass flag for this kill zone session."""
+    s = _load_session()
+    s[f"trend_bypass_{kill_zone}"] = True
+    _save_session(s)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # RISK MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════════
@@ -373,18 +425,17 @@ def check_daily_dd(client: TradingClient) -> float:
 
 def count_daily_losses(client: TradingClient) -> int:
     """
-    Estimate daily loss count from realized equity change.
-    Robust vs order-type string parsing (Alpaca fills stops as 'market' type).
-    Each loss ≈ RISK_PER_TRADE × equity.
+    Estimate ICT-isolated daily loss count.
+    Uses ICT session start equity (not previous day close) so Kronos NVDA
+    losses don't consume ICT's daily trade budget.
     """
     try:
-        acct          = client.get_account()
-        eq            = float(acct.equity)
-        prev          = float(acct.last_equity)
-        daily_pnl     = eq - prev
+        start_eq       = get_ict_session_start_equity(client)
+        current_eq     = get_account_equity(client)
+        daily_pnl      = current_eq - start_eq
         if daily_pnl >= 0:
             return 0
-        loss_per_trade = max(prev * RISK_PER_TRADE, 1.0)
+        loss_per_trade = max(start_eq * RISK_PER_TRADE, 1.0)
         return min(DAILY_LOSS_LIMIT + 1, int(abs(daily_pnl) / loss_per_trade))
     except Exception as e:
         log(f"[WARN] Could not count daily losses: {e}")
@@ -517,17 +568,26 @@ def manage_open_position(client: TradingClient, pos: dict) -> None:
             send_telegram(f"⏰ ICT TIME EXIT: {kz} ended — position closed at session close")
             return
 
-        # ── 60-min stagnation stop ────────────────────────────────────────────
+        # ── 60-min stagnation stop (time + structural condition) ─────────────
         try:
             opened_at    = datetime.fromisoformat(state["opened_at"])
             elapsed_bars = (datetime.now() - opened_at).total_seconds() / 300
             if elapsed_bars >= STAGNATION_BARS:
-                live_pos = client.get_open_position(SYMBOL)
-                if float(live_pos.unrealized_pl) <= 0:
-                    log(f"[TIME EXIT] {elapsed_bars:.0f} bars open, not in profit — stagnation stop")
+                live_pos      = client.get_open_position(SYMBOL)
+                unrealized_pl = float(live_pos.unrealized_pl)
+                current_px    = float(live_pos.current_price)
+                midline       = (state["entry"] + state["sl"]) / 2   # OB/FVG midline
+
+                # Exit if: not in profit AND price has moved back through the midline
+                structure_broken = (
+                    (state["signal"] == "BUY"  and current_px < midline) or
+                    (state["signal"] == "SELL" and current_px > midline)
+                )
+                if unrealized_pl <= 0 and structure_broken:
+                    log(f"[TIME EXIT] {elapsed_bars:.0f} bars, not in profit, structure broken at midline {midline:.2f}")
                     close_ict_position(client)
                     clear_state()
-                    send_telegram(f"⏰ ICT STAGNATION EXIT: {elapsed_bars:.0f} bars flat/losing")
+                    send_telegram(f"⏰ ICT STAGNATION EXIT: {elapsed_bars:.0f} bars + structure broken")
                     return
         except Exception:
             pass
@@ -593,6 +653,22 @@ def main() -> None:
     client      = TradingClient(key, secret, paper=True)
     log("Alpaca paper client connected")
 
+    # ── Priority 0: Session exit always runs first — bypasses all other logic ──
+    # This prevents phase transition lock-outs from blocking session closes.
+    _pos_early   = get_ict_position(client)
+    _state_early = load_state()
+    if _pos_early and _state_early:
+        _ET     = ICTModel.ET
+        _now_et = datetime.now(_ET)
+        _kz     = _state_early.get("kill_zone")
+        _cutoff = SESSION_CUTOFFS_ET.get(_kz)
+        if _cutoff and _now_et.time() >= _cutoff:
+            log(f"[PRIORITY EXIT] {_kz} ended — closing before any other checks")
+            close_ict_position(client)
+            clear_state()
+            send_telegram(f"⏰ ICT TIME EXIT: {_kz} session closed")
+            return
+
     # ── Risk checks ────────────────────────────────────────────────────────
     daily_dd = check_daily_dd(client)
     total_dd = check_total_dd(client)
@@ -657,7 +733,17 @@ def main() -> None:
         send_telegram(f"⚠️ ICT DATA FEED CHANGE: {state['data_source']} → {data_source} — entries frozen")
         return
 
+    # Pass trend day bypass state from session file into model
+    active_kz      = None   # determined after signal
+    trend_bp_state = {}     # {kz: bool} — loaded per kill zone below
+
     signal = model.get_signal(df_5m, df_1h, df_correlated=df_corr)
+
+    # Persist trend day bypass if signal reason indicates it
+    if signal.get("kill_zone"):
+        active_kz = signal["kill_zone"]
+        if "[TREND_DAY]" in signal.get("reason", "") or get_trend_day_bypass(active_kz):
+            set_trend_day_bypass(active_kz)
 
     # Translate ES1! price levels → SPY prices when TradingView data was used
     if data_source == "tradingview" and signal["signal"] != "HOLD":
@@ -667,6 +753,13 @@ def main() -> None:
 
     if signal["signal"] == "HOLD":
         log("No ICT setup — standing by")
+        return
+
+    # ── Entry drift gate — skip if price moved too far from FVG entry ────────
+    current_px  = float(df_5m["close"].iloc[-1])
+    entry_drift = abs(current_px - signal["entry"]) / signal["entry"]
+    if entry_drift > MAX_ENTRY_DRIFT:
+        log(f"[SKIP] Entry drift {entry_drift:.3%} > {MAX_ENTRY_DRIFT:.3%} — price moved from FVG zone")
         return
 
     # ── Position sizing ─────────────────────────────────────────────────────

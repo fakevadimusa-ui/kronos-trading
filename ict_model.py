@@ -476,13 +476,14 @@ class ICTModel:
         """
         True if the FVG overlaps with an active Order Block of the same direction.
         FVG inside OB = Unicorn Setup — highest-probability confluence entry.
+        Uses >= so touching arrays (FVG edge exactly at OB boundary) are included.
         """
         for ob in obs:
             if ob["type"] != fvg["type"]:
                 continue
             overlap_top = min(fvg["top"], ob["top"])
             overlap_bot = max(fvg["bottom"], ob["bottom"])
-            if overlap_top > overlap_bot:   # genuine price overlap
+            if overlap_top >= overlap_bot:   # >= catches exact-touch Unicorns
                 return True
         return False
 
@@ -679,7 +680,9 @@ class ICTModel:
                 base["reason"] = f"Phase transition lock-out (±2 min of {boundary}) — no entries"
                 return base
 
-        smt       = self.detect_smt(df_entry, df_correlated, lookback=5)
+        # London low-volume: need wider lookback to detect structural divergence
+        smt_lookback = 12 if kz == "london" else 5
+        smt       = self.detect_smt(df_entry, df_correlated, lookback=smt_lookback)
         judas     = self.detect_judas_swing(df_entry, df_correlated, current_time_et)
         smt_tag   = f" SMT:{smt}" if smt else ""
         judas_tag = f" JUDAS:{judas}" if judas else ""
@@ -726,18 +729,11 @@ class ICTModel:
                 base["reason"] = f"Price in discount ({current_price:.2f} < midnight {midnight_open:.2f}) — wait for premium"
                 return base
 
-        # ── PDH/PDL proximity filter ──────────────────────────────────────────
+        # ── PDH/PDL R:R validation ────────────────────────────────────────────
+        # Don't block by proximity — PDH/PDL IS the target (liquidity magnet).
+        # Only block if so close that minimum 1:3 R:R is impossible.
+        # Evaluated per-setup (after SL is known) inside the FVG/OB loops below.
         pdh, pdl = self.get_pdh_pdl(df_1h) if df_1h is not None else (None, None)
-        if pdh and pdl and df_1h is not None and len(df_1h) >= 14:
-            tr    = np.abs(df_1h["high"].values[-14:] - df_1h["low"].values[-14:])
-            atr1h = tr.mean()
-            buf   = 0.15 * atr1h
-            if htf_bias == "bull" and abs(current_price - pdh) <= buf:
-                base["reason"] = f"Within {buf:.2f} of PDH {pdh:.2f} — already at target, no new longs"
-                return base
-            if htf_bias == "bear" and abs(current_price - pdl) <= buf:
-                base["reason"] = f"Within {buf:.2f} of PDL {pdl:.2f} — already at target, no new shorts"
-                return base
 
         # ── Entry timeframe structure ─────────────────────────────────────────
         structure, _ = self.detect_market_structure(df_entry)
@@ -768,6 +764,11 @@ class ICTModel:
                 if risk <= 0:
                     continue
                 tp       = entry + risk * self.rr_ratio
+                # PDH R:R gate: PDH must be beyond TP (target reachable)
+                if pdh and htf_bias == "bull" and pdh < tp:
+                    tp = min(tp, pdh)   # cap TP at PDH as Draw on Liquidity
+                    if (tp - entry) < risk:   # R:R < 1:1 — not worth it
+                        continue
                 disp     = " [DISP]" if fvg["displacement"] else ""
                 unicorn  = " [UNICORN]" if self.detect_unicorn(fvg, recent_obs) else ""
                 return {**base,
@@ -775,7 +776,7 @@ class ICTModel:
                     "entry":  round(entry, 4),
                     "sl":     round(sl, 4),
                     "tp":     round(tp, 4),
-                    "rr":     self.rr_ratio,
+                    "rr":     round((tp - entry) / risk, 2),
                     "setup":  "FVG" + unicorn.strip(),
                     "reason": f"Bullish FVG{disp}{unicorn} [{fvg['bottom']:.2f}–{fvg['top']:.2f}] OTE≤{ote_top:.2f} | {kz} | HTF:{htf_bias}{smt_tag}{judas_tag}",
                 }
@@ -815,6 +816,10 @@ class ICTModel:
                 if risk <= 0:
                     continue
                 tp      = entry - risk * self.rr_ratio
+                if pdl and htf_bias == "bear" and pdl > tp:
+                    tp = max(tp, pdl)
+                    if (entry - tp) < risk:
+                        continue
                 disp    = " [DISP]" if fvg["displacement"] else ""
                 unicorn = " [UNICORN]" if self.detect_unicorn(fvg, recent_obs) else ""
                 return {**base,
@@ -822,7 +827,7 @@ class ICTModel:
                     "entry":  round(entry, 4),
                     "sl":     round(sl, 4),
                     "tp":     round(tp, 4),
-                    "rr":     self.rr_ratio,
+                    "rr":     round((entry - tp) / risk, 2),
                     "setup":  "FVG" + unicorn.strip(),
                     "reason": f"Bearish FVG{disp}{unicorn} [{fvg['bottom']:.2f}–{fvg['top']:.2f}] OTE≥{ote_bottom:.2f} | {kz} | HTF:{htf_bias}{smt_tag}{judas_tag}",
                 }
