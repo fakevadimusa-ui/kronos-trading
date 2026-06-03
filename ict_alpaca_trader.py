@@ -60,7 +60,7 @@ from ict_model import ICTModel
 # ══════════════════════════════════════════════════════════════════════════════
 
 CONFIG_PATH   = Path.home() / "freqtrade/user_data/config_kronos_nvda.json"
-TV_FETCH      = Path.home() / "tradingview-mcp/tv_fetch.js"
+TV_FETCH      = Path(__file__).parent / "tv_fetch.js"
 
 SIGNAL_SYMBOL = "CME_MINI_DL:ES1!"   # ICT analysis instrument (TradingView)
 SYMBOL        = "SPY"                  # Alpaca execution instrument
