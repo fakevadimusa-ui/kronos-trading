@@ -205,7 +205,7 @@ def place_bracket_order(
         symbol=SYMBOL,
         qty=shares,
         side=side,
-        time_in_force=TimeInForce.DAY,
+        time_in_force=TimeInForce.GTC,
         order_class=OrderClass.BRACKET,
         take_profit={"limit_price": str(tp_price)},
         stop_loss={"stop_price": str(sl_price)},
