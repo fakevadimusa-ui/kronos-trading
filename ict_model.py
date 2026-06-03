@@ -18,7 +18,7 @@ Usage:
 import numpy as np
 import pandas as pd
 import pytz
-from datetime import datetime, time
+from datetime import datetime, date, time
 from typing import Optional
 
 
@@ -280,6 +280,74 @@ class ICTModel:
         return False
 
     # ──────────────────────────────────────────────────────────────────────────
+    # MIDNIGHT OPEN — PREMIUM / DISCOUNT
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def get_midnight_open(self, df: pd.DataFrame) -> Optional[float]:
+        """
+        Return the open price of the bar at/closest to midnight ET today.
+        Price above midnight open = premium (algo selling zone).
+        Price below midnight open = discount (algo buying zone).
+        """
+        try:
+            idx = df.index
+            if idx.tz is None:
+                idx = idx.tz_localize("UTC")
+            idx_et = idx.tz_convert(self.ET)
+            today  = datetime.now(self.ET).date()
+            today_bars = df[idx_et.date == today]
+            if len(today_bars) == 0:
+                return None
+            return float(today_bars["open"].iloc[0])
+        except Exception:
+            return None
+
+    def is_discount(self, price: float, midnight_open: float) -> bool:
+        return price < midnight_open
+
+    def is_premium(self, price: float, midnight_open: float) -> bool:
+        return price > midnight_open
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # SMT DIVERGENCE (NQ vs ES / QQQ vs SPY)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def detect_smt(
+        self,
+        df_primary:    pd.DataFrame,
+        df_correlated: pd.DataFrame,
+        lookback: int = 20,
+    ) -> Optional[str]:
+        """
+        SMT Divergence: one instrument makes a new extreme, the other holds.
+        Bullish:  correlated (NQ) sweeps a lower low, primary (ES) holds higher low
+                  → institutions absorbing sell orders on ES, move up incoming
+        Bearish:  correlated (NQ) sweeps a higher high, primary (ES) holds lower high
+                  → institutions distributing ES, move down incoming
+        Returns: 'bullish', 'bearish', or None
+        """
+        if df_primary is None or df_correlated is None:
+            return None
+        n = min(lookback, len(df_primary), len(df_correlated))
+        if n < 5:
+            return None
+
+        p_lows  = df_primary["low"].values[-n:]
+        c_lows  = df_correlated["low"].values[-n:]
+        p_highs = df_primary["high"].values[-n:]
+        c_highs = df_correlated["high"].values[-n:]
+
+        # Bullish SMT: NQ new low, ES holds (NQ current low < all prior lows, ES current > its min)
+        if c_lows[-1] <= c_lows[:-1].min() and p_lows[-1] > p_lows[:-1].min():
+            return "bullish"
+
+        # Bearish SMT: NQ new high, ES holds lower
+        if c_highs[-1] >= c_highs[:-1].max() and p_highs[-1] < p_highs[:-1].max():
+            return "bearish"
+
+        return None
+
+    # ──────────────────────────────────────────────────────────────────────────
     # HTF BIAS
     # ──────────────────────────────────────────────────────────────────────────
 
@@ -298,6 +366,7 @@ class ICTModel:
         self,
         df_entry:        pd.DataFrame,
         df_1h:           Optional[pd.DataFrame] = None,
+        df_correlated:   Optional[pd.DataFrame] = None,   # NQ1!/QQQ for SMT
         current_time_et: Optional[datetime]     = None,
     ) -> dict:
         """
@@ -347,6 +416,23 @@ class ICTModel:
         htf_bias = self.get_htf_bias(df_1h)
         base["htf_bias"] = htf_bias
 
+        # ── Midnight open premium/discount filter ─────────────────────────────
+        midnight_open = self.get_midnight_open(df_entry)
+        current_price = float(df_entry["close"].iloc[-1])
+        if midnight_open is not None:
+            in_discount = self.is_discount(current_price, midnight_open)
+            in_premium  = self.is_premium(current_price, midnight_open)
+            if htf_bias == "bull" and not in_discount:
+                base["reason"] = f"Price in premium ({current_price:.2f} > midnight open {midnight_open:.2f}) — wait for discount to buy"
+                return base
+            if htf_bias == "bear" and not in_premium:
+                base["reason"] = f"Price in discount ({current_price:.2f} < midnight open {midnight_open:.2f}) — wait for premium to sell"
+                return base
+
+        # ── SMT divergence (NQ vs ES confirmation) ────────────────────────────
+        smt = self.detect_smt(df_entry, df_correlated)
+        smt_tag = f" SMT:{smt}" if smt else ""
+
         # ── Entry timeframe structure ─────────────────────────────────────────
         structure, _ = self.detect_market_structure(df_entry)
 
@@ -361,8 +447,6 @@ class ICTModel:
         recent_events = structure[-5:] if len(structure) >= 5 else structure
         all_obs       = self.detect_order_blocks(df_entry, recent_events)
         recent_obs    = [o for o in all_obs if o["idx"] > len(df_entry) - self.ob_recency]
-
-        current_price = float(df_entry["close"].iloc[-1])
 
         # ── BULLISH setups ────────────────────────────────────────────────────
         if htf_bias in ("bull", "neutral"):
@@ -387,7 +471,7 @@ class ICTModel:
                     "tp":     round(tp, 4),
                     "rr":     self.rr_ratio,
                     "setup":  "FVG",
-                    "reason": f"Bullish FVG{disp} [{fvg['bottom']:.2f}–{fvg['top']:.2f}] OTE≤{ote_top:.2f} | {kz} | HTF:{htf_bias}",
+                    "reason": f"Bullish FVG{disp} [{fvg['bottom']:.2f}–{fvg['top']:.2f}] OTE≤{ote_top:.2f} | {kz} | HTF:{htf_bias}{smt_tag}",
                 }
 
             for ob in sorted(recent_obs, key=lambda x: -x["idx"]):
@@ -408,7 +492,7 @@ class ICTModel:
                     "tp":     round(tp, 4),
                     "rr":     self.rr_ratio,
                     "setup":  "OB",
-                    "reason": f"Bullish OB [{ob['bottom']:.2f}–{ob['top']:.2f}] | {kz} | HTF:{htf_bias}",
+                    "reason": f"Bullish OB [{ob['bottom']:.2f}–{ob['top']:.2f}] | {kz} | HTF:{htf_bias}{smt_tag}",
                 }
 
         # ── BEARISH setups ────────────────────────────────────────────────────
@@ -416,7 +500,6 @@ class ICTModel:
             for fvg in recent_fvgs:
                 if fvg["type"] != "BEAR":
                     continue
-                # OTE: price must be in upper 50% of FVG (shallower = deeper retracement up)
                 ote_bottom = fvg["mid"]
                 if not (ote_bottom <= current_price <= fvg["top"]):
                     continue
@@ -434,7 +517,7 @@ class ICTModel:
                     "tp":     round(tp, 4),
                     "rr":     self.rr_ratio,
                     "setup":  "FVG",
-                    "reason": f"Bearish FVG{disp} [{fvg['bottom']:.2f}–{fvg['top']:.2f}] OTE≥{ote_bottom:.2f} | {kz} | HTF:{htf_bias}",
+                    "reason": f"Bearish FVG{disp} [{fvg['bottom']:.2f}–{fvg['top']:.2f}] OTE≥{ote_bottom:.2f} | {kz} | HTF:{htf_bias}{smt_tag}",
                 }
 
             for ob in sorted(recent_obs, key=lambda x: -x["idx"]):
@@ -455,7 +538,7 @@ class ICTModel:
                     "tp":     round(tp, 4),
                     "rr":     self.rr_ratio,
                     "setup":  "OB",
-                    "reason": f"Bearish OB [{ob['bottom']:.2f}–{ob['top']:.2f}] | {kz} | HTF:{htf_bias}",
+                    "reason": f"Bearish OB [{ob['bottom']:.2f}–{ob['top']:.2f}] | {kz} | HTF:{htf_bias}{smt_tag}",
                 }
 
         base["reason"] = f"No ICT setup in {kz} kill zone | HTF:{htf_bias}"
