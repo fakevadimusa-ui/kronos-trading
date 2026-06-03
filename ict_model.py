@@ -18,7 +18,7 @@ Usage:
 import numpy as np
 import pandas as pd
 import pytz
-from datetime import datetime, date, time
+from datetime import datetime, date, time, timedelta
 from typing import Optional
 
 
@@ -348,6 +348,166 @@ class ICTModel:
         return None
 
     # ──────────────────────────────────────────────────────────────────────────
+    # PREVIOUS DAY HIGH / LOW
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def get_pdh_pdl(self, df_1h: pd.DataFrame) -> tuple[Optional[float], Optional[float]]:
+        """Return (previous_day_high, previous_day_low) from 1H bars."""
+        try:
+            idx = df_1h.index
+            if idx.tz is None:
+                idx = idx.tz_localize("UTC")
+            idx_et   = idx.tz_convert(self.ET)
+            today    = datetime.now(self.ET).date()
+            prev_day = today - timedelta(days=1)
+            while prev_day.weekday() >= 5:
+                prev_day -= timedelta(days=1)
+            prev_bars = df_1h[idx_et.date == prev_day]
+            if len(prev_bars) == 0:
+                return None, None
+            return float(prev_bars["high"].max()), float(prev_bars["low"].min())
+        except Exception:
+            return None, None
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AMD STATE MACHINE
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def get_amd_phase(self, dt_et: Optional[datetime] = None) -> Optional[str]:
+        """
+        Returns current AMD phase: 'accumulation', 'manipulation', 'distribution', or None.
+
+        London session:
+          00:00–02:00 ET → accumulation  (Asian range forms)
+          02:00–03:30 ET → manipulation  (Asian range sweep, Judas Swing)
+          03:30–05:00 ET → distribution  (true London move)
+
+        NY AM session:
+          07:00–08:30 ET → accumulation  (pre-news ranging)
+          08:30–09:45 ET → manipulation  (Judas Swing at 8:30/9:30 macro)
+          09:45–11:30 ET → distribution  (true NY trend continuation)
+
+        Silver Bullet:
+          13:00–13:30 ET → accumulation
+          13:30–14:30 ET → manipulation
+          14:30–16:00 ET → distribution
+        """
+        if dt_et is None:
+            dt_et = datetime.now(self.ET)
+        t = dt_et.time()
+
+        AMD = [
+            (time(0,  0),  time(2,  0),  "accumulation"),   # London A
+            (time(2,  0),  time(3, 30),  "manipulation"),    # London M
+            (time(3, 30),  time(5,  0),  "distribution"),    # London D
+            (time(7,  0),  time(8, 30),  "accumulation"),    # NY A
+            (time(8, 30),  time(9, 45),  "manipulation"),    # NY M (Judas)
+            (time(9, 45),  time(11, 30), "distribution"),    # NY D
+            (time(13,  0), time(13, 30), "accumulation"),    # Silver A
+            (time(13, 30), time(14, 30), "manipulation"),    # Silver M
+            (time(14, 30), time(16,  0), "distribution"),    # Silver D
+        ]
+        for start, end, phase in AMD:
+            if start <= t < end:
+                return phase
+        return None
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # JUDAS SWING DETECTION
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def detect_judas_swing(
+        self,
+        df_entry:      pd.DataFrame,
+        df_correlated: Optional[pd.DataFrame],
+        dt_et:         Optional[datetime] = None,
+    ) -> Optional[str]:
+        """
+        Detect an engineered fake move (Judas Swing) at 8:30 or 9:30 ET macro opens.
+        Returns: 'bull_trap' (fake up → real move down)
+                 'bear_trap' (fake down → real move up)
+                 None if no Judas Swing detected.
+
+        Conditions (all three must be true):
+          1. Inside manipulation time window (8:30–9:45 ET or 9:30–10:00 ET)
+          2. Volume on current bar < 10-bar moving average (low-conviction move)
+          3. SMT divergence: NQ diverges from ES (institutional non-confirmation)
+          4. Price swept a local swing high or low in the last 20 bars
+        """
+        if dt_et is None:
+            dt_et = datetime.now(self.ET)
+        t = dt_et.time()
+
+        judas_windows = [
+            (time(8, 30), time(9, 45)),
+            (time(9, 30), time(10, 0)),
+        ]
+        if not any(s <= t <= e for s, e in judas_windows):
+            return None
+
+        if len(df_entry) < 15:
+            return None
+
+        vols    = df_entry["volume"].values
+        vol_ma  = vols[-11:-1].mean()
+        low_vol = vols[-1] < vol_ma
+
+        smt     = self.detect_smt(df_entry, df_correlated, lookback=10)
+
+        highs           = df_entry["high"].values[-20:]
+        lows            = df_entry["low"].values[-20:]
+        swept_buy_side  = highs[-1] > highs[:-1].max()   # fake breakout up
+        swept_sell_side = lows[-1]  < lows[:-1].min()    # fake breakdown down
+
+        if low_vol and smt == "bearish" and swept_buy_side:
+            return "bull_trap"
+        if low_vol and smt == "bullish" and swept_sell_side:
+            return "bear_trap"
+        return None
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # EDGE CONDITIONS (ATR + INSIDE DAY PAUSE)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def check_edge_conditions(
+        self,
+        df_entry: pd.DataFrame,
+        df_1h:    Optional[pd.DataFrame],
+    ) -> tuple[bool, str]:
+        """
+        Returns (trading_ok, reason).
+        False = pause strategy — edge is compromised.
+
+        Killer 1: Daily ATR < 70% of its 20-period MA → chop, false breakouts
+        Killer 2: Price contained inside PDH/PDL for last 4 hours → no expansion
+        """
+        try:
+            if df_1h is not None and len(df_1h) >= 35:
+                closes = df_1h["close"].values
+                highs  = df_1h["high"].values
+                lows   = df_1h["low"].values
+                tr     = np.maximum.reduce([
+                    highs[1:] - lows[1:],
+                    np.abs(highs[1:] - closes[:-1]),
+                    np.abs(lows[1:]  - closes[:-1]),
+                ])
+                atr14   = tr[-14:].mean()
+                atr_ma  = np.array([tr[i:i+14].mean() for i in range(len(tr) - 13)]).mean()
+                if atr14 < atr_ma * 0.70:
+                    return False, f"Low volatility: ATR {atr14:.2f} < 70% of MA {atr_ma:.2f} — strategy paused"
+
+            pdh, pdl = self.get_pdh_pdl(df_1h) if df_1h is not None else (None, None)
+            if pdh and pdl and len(df_entry) >= 48:
+                recent_high = df_entry["high"].values[-48:].max()
+                recent_low  = df_entry["low"].values[-48:].min()
+                if recent_low >= pdl and recent_high <= pdh:
+                    return False, f"Inside day: price in PDH/PDL [{pdl:.2f}–{pdh:.2f}] for 4+ hrs — strategy paused"
+
+            return True, "OK"
+        except Exception:
+            return True, "OK"   # fail open
+
+    # ──────────────────────────────────────────────────────────────────────────
     # HTF BIAS
     # ──────────────────────────────────────────────────────────────────────────
 
@@ -412,9 +572,32 @@ class ICTModel:
 
         base["kill_zone"] = kz
 
+        # ── Edge conditions (volatility + inside day) ─────────────────────────
+        edge_ok, edge_reason = self.check_edge_conditions(df_entry, df_1h)
+        if not edge_ok:
+            base["reason"] = edge_reason
+            return base
+
         # ── HTF bias ─────────────────────────────────────────────────────────
         htf_bias = self.get_htf_bias(df_1h)
         base["htf_bias"] = htf_bias
+
+        # ── AMD phase filter ──────────────────────────────────────────────────
+        amd_phase = self.get_amd_phase(current_time_et)
+        if amd_phase == "accumulation":
+            base["reason"] = f"AMD accumulation — marking range, no entries"
+            return base
+
+        # ── SMT divergence + Judas Swing ─────────────────────────────────────
+        smt       = self.detect_smt(df_entry, df_correlated)
+        judas     = self.detect_judas_swing(df_entry, df_correlated, current_time_et)
+        smt_tag   = f" SMT:{smt}" if smt else ""
+        judas_tag = f" JUDAS:{judas}" if judas else ""
+
+        # Manipulation phase: only enter on confirmed Judas Swing reversal
+        if amd_phase == "manipulation" and not judas:
+            base["reason"] = f"AMD manipulation — waiting for Judas Swing sweep+reversal{smt_tag}"
+            return base
 
         # ── Midnight open premium/discount filter ─────────────────────────────
         midnight_open = self.get_midnight_open(df_entry)
@@ -423,15 +606,24 @@ class ICTModel:
             in_discount = self.is_discount(current_price, midnight_open)
             in_premium  = self.is_premium(current_price, midnight_open)
             if htf_bias == "bull" and not in_discount:
-                base["reason"] = f"Price in premium ({current_price:.2f} > midnight open {midnight_open:.2f}) — wait for discount to buy"
+                base["reason"] = f"Price in premium ({current_price:.2f} > midnight {midnight_open:.2f}) — wait for discount"
                 return base
             if htf_bias == "bear" and not in_premium:
-                base["reason"] = f"Price in discount ({current_price:.2f} < midnight open {midnight_open:.2f}) — wait for premium to sell"
+                base["reason"] = f"Price in discount ({current_price:.2f} < midnight {midnight_open:.2f}) — wait for premium"
                 return base
 
-        # ── SMT divergence (NQ vs ES confirmation) ────────────────────────────
-        smt = self.detect_smt(df_entry, df_correlated)
-        smt_tag = f" SMT:{smt}" if smt else ""
+        # ── PDH/PDL proximity filter ──────────────────────────────────────────
+        pdh, pdl = self.get_pdh_pdl(df_1h) if df_1h is not None else (None, None)
+        if pdh and pdl and df_1h is not None and len(df_1h) >= 14:
+            tr    = np.abs(df_1h["high"].values[-14:] - df_1h["low"].values[-14:])
+            atr1h = tr.mean()
+            buf   = 0.15 * atr1h
+            if htf_bias == "bull" and abs(current_price - pdh) <= buf:
+                base["reason"] = f"Within {buf:.2f} of PDH {pdh:.2f} — already at target, no new longs"
+                return base
+            if htf_bias == "bear" and abs(current_price - pdl) <= buf:
+                base["reason"] = f"Within {buf:.2f} of PDL {pdl:.2f} — already at target, no new shorts"
+                return base
 
         # ── Entry timeframe structure ─────────────────────────────────────────
         structure, _ = self.detect_market_structure(df_entry)
@@ -471,7 +663,7 @@ class ICTModel:
                     "tp":     round(tp, 4),
                     "rr":     self.rr_ratio,
                     "setup":  "FVG",
-                    "reason": f"Bullish FVG{disp} [{fvg['bottom']:.2f}–{fvg['top']:.2f}] OTE≤{ote_top:.2f} | {kz} | HTF:{htf_bias}{smt_tag}",
+                    "reason": f"Bullish FVG{disp} [{fvg['bottom']:.2f}–{fvg['top']:.2f}] OTE≤{ote_top:.2f} | {kz} | HTF:{htf_bias}{smt_tag}{judas_tag}",
                 }
 
             for ob in sorted(recent_obs, key=lambda x: -x["idx"]):
@@ -492,7 +684,7 @@ class ICTModel:
                     "tp":     round(tp, 4),
                     "rr":     self.rr_ratio,
                     "setup":  "OB",
-                    "reason": f"Bullish OB [{ob['bottom']:.2f}–{ob['top']:.2f}] | {kz} | HTF:{htf_bias}{smt_tag}",
+                    "reason": f"Bullish OB [{ob['bottom']:.2f}–{ob['top']:.2f}] | {kz} | HTF:{htf_bias}{smt_tag}{judas_tag}",
                 }
 
         # ── BEARISH setups ────────────────────────────────────────────────────
@@ -517,7 +709,7 @@ class ICTModel:
                     "tp":     round(tp, 4),
                     "rr":     self.rr_ratio,
                     "setup":  "FVG",
-                    "reason": f"Bearish FVG{disp} [{fvg['bottom']:.2f}–{fvg['top']:.2f}] OTE≥{ote_bottom:.2f} | {kz} | HTF:{htf_bias}{smt_tag}",
+                    "reason": f"Bearish FVG{disp} [{fvg['bottom']:.2f}–{fvg['top']:.2f}] OTE≥{ote_bottom:.2f} | {kz} | HTF:{htf_bias}{smt_tag}{judas_tag}",
                 }
 
             for ob in sorted(recent_obs, key=lambda x: -x["idx"]):
@@ -538,7 +730,7 @@ class ICTModel:
                     "tp":     round(tp, 4),
                     "rr":     self.rr_ratio,
                     "setup":  "OB",
-                    "reason": f"Bearish OB [{ob['bottom']:.2f}–{ob['top']:.2f}] | {kz} | HTF:{htf_bias}{smt_tag}",
+                    "reason": f"Bearish OB [{ob['bottom']:.2f}–{ob['top']:.2f}] | {kz} | HTF:{htf_bias}{smt_tag}{judas_tag}",
                 }
 
         base["reason"] = f"No ICT setup in {kz} kill zone | HTF:{htf_bias}"

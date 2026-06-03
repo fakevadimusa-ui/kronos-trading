@@ -36,7 +36,7 @@ import socket
 import subprocess
 import sys
 import warnings
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time
 from pathlib import Path
 
 import numpy as np
@@ -84,6 +84,15 @@ DAILY_LOSS_LIMIT     = 2       # halt after 2 losses in one day
 DAILY_PROFIT_TARGET  = 0.015   # bank gains and stop at +1.5% for the day
 
 CORR_SYMBOL = "QQQ"   # NQ proxy for SMT divergence
+
+# Hard time cutoffs — force-close any open ICT position at session end
+SESSION_CUTOFFS_ET = {
+    "london":        time(5,  0),
+    "new_york":      time(11, 30),
+    "london_close":  time(12, 0),
+    "silver_bullet": time(16, 0),
+}
+STAGNATION_BARS = 12   # 60 min at 5m — close flat/losing position
 
 ICT_TAG = "ICT"   # order tag to identify our positions vs Kronos positions
 
@@ -439,14 +448,45 @@ def close_ict_position(client: TradingClient) -> None:
 
 def manage_open_position(client: TradingClient, pos: dict) -> None:
     """
-    Position is managed by Alpaca bracket orders — SL/TP auto-execute on exchange.
-    We just log current status and skip entering a new trade.
+    Check time-based exits first, then log position status.
+    Bracket orders handle SL/TP on exchange; time exits are our kill switch.
     """
+    ET = ICTModel.ET
+    now_et = datetime.now(ET)
+
+    # ── Hard session end cutoff ───────────────────────────────────────────────
+    state = load_state()
+    if state:
+        kz      = state.get("kill_zone")
+        cutoff  = SESSION_CUTOFFS_ET.get(kz)
+        if cutoff and now_et.time() >= cutoff:
+            log(f"[TIME EXIT] {kz} session ended at {cutoff} ET — closing position")
+            close_ict_position(client)
+            clear_state()
+            send_telegram(f"⏰ ICT TIME EXIT: {kz} ended — position closed at session close")
+            return
+
+        # ── 60-min stagnation stop ────────────────────────────────────────────
+        try:
+            opened_at    = datetime.fromisoformat(state["opened_at"])
+            elapsed_bars = (datetime.now() - opened_at).total_seconds() / 300
+            if elapsed_bars >= STAGNATION_BARS:
+                live_pos = client.get_open_position(SYMBOL)
+                if float(live_pos.unrealized_pl) <= 0:
+                    log(f"[TIME EXIT] {elapsed_bars:.0f} bars open, not in profit — stagnation stop")
+                    close_ict_position(client)
+                    clear_state()
+                    send_telegram(f"⏰ ICT STAGNATION EXIT: {elapsed_bars:.0f} bars flat/losing")
+                    return
+        except Exception:
+            pass
+
+    # ── Regular status log ────────────────────────────────────────────────────
     try:
         live_pos       = client.get_open_position(SYMBOL)
         current        = float(live_pos.current_price)
         unrealized_pct = float(live_pos.unrealized_plpc)
-        log(f"[HOLD] {SYMBOL} {pos['side']} @ {current:.2f} | Unrealized: {unrealized_pct:.2%} | Bracket orders active on Alpaca")
+        log(f"[HOLD] {SYMBOL} {pos['side']} @ {current:.2f} | Unrealized: {unrealized_pct:.2%} | Bracket active")
     except Exception as e:
         log(f"[WARN] Could not fetch live position: {e}")
 
