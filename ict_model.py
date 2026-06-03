@@ -33,11 +33,12 @@ class ICTModel:
         "silver_bullet": (time(13, 30), time(16, 0)),
     }
 
-    # News blackout windows (ET) — no entries ±5 min around high-impact releases
+    # News blackout windows (ET) — tier-1 events get ±15 min, others ±5 min
+    # Liquidity doesn't recover within 5 min after NFP/CPI/FOMC — spreads stay wide
     NEWS_BLACKOUTS = [
-        (time(8, 25),  time(8, 35)),    # 8:30 ET: NFP, CPI, PPI, Jobless Claims
-        (time(9, 25),  time(9, 35)),    # 9:30 ET: NY equities open
-        (time(13, 55), time(14, 5)),    # 2:00 ET: FOMC (8×/year, static blackout)
+        (time(8, 15),  time(8, 45)),    # 8:30 ET: NFP/CPI/PPI/Jobless Claims — ±15 min
+        (time(9, 25),  time(9, 35)),    # 9:30 ET: equities open — ±5 min
+        (time(13, 45), time(14, 15)),   # 2:00 ET: FOMC — ±15 min
     ]
 
     def __init__(
@@ -662,7 +663,23 @@ class ICTModel:
             return base
 
         # ── SMT divergence + Judas Swing / Trend Day ─────────────────────────
-        smt       = self.detect_smt(df_entry, df_correlated)
+        # ── Phase transition ±2 min lock-out ─────────────────────────────────
+        PHASE_TRANSITIONS = [
+            time(2, 0), time(3, 30),     # London M/D boundaries
+            time(8, 30), time(9, 45),    # NY M/D boundaries
+            time(13, 30), time(14, 30),  # Silver Bullet M/D boundaries
+        ]
+        now_t = (current_time_et or datetime.now(self.ET)).time()
+        for boundary in PHASE_TRANSITIONS:
+            boundary_dt = datetime.combine(
+                (current_time_et or datetime.now(self.ET)).date(), boundary
+            )
+            now_dt = (current_time_et or datetime.now(self.ET))
+            if abs((now_dt.replace(tzinfo=None) - boundary_dt).total_seconds()) <= 120:
+                base["reason"] = f"Phase transition lock-out (±2 min of {boundary}) — no entries"
+                return base
+
+        smt       = self.detect_smt(df_entry, df_correlated, lookback=5)
         judas     = self.detect_judas_swing(df_entry, df_correlated, current_time_et)
         smt_tag   = f" SMT:{smt}" if smt else ""
         judas_tag = f" JUDAS:{judas}" if judas else ""
@@ -670,6 +687,16 @@ class ICTModel:
         if amd_phase == "manipulation":
             accum_high, accum_low = self.get_accumulation_box(df_entry, current_time_et)
             if accum_high and accum_low:
+                # Validate box range — reject if flat (holiday) or gap-inflated
+                box_range = accum_high - accum_low
+                atr_ref   = float(np.abs(df_entry["high"].values[-14:] - df_entry["low"].values[-14:]).mean())
+                if atr_ref > 0:
+                    if box_range < 0.10 * atr_ref:
+                        base["reason"] = f"Accumulation box too flat ({box_range:.4f} < 10% ATR) — holiday/no-volume"
+                        return base
+                    if box_range > 2.0 * atr_ref:
+                        base["reason"] = f"Accumulation box gap-inflated ({box_range:.4f} > 2× ATR) — skip session"
+                        return base
                 price_inside_box = accum_low <= current_price <= accum_high
                 if price_inside_box and not judas:
                     # Price still inside accumulation range — need sweep + reversal

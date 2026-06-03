@@ -35,6 +35,7 @@ import os
 import socket
 import subprocess
 import sys
+import time as _time   # stdlib time — for sleep(); avoid shadowing datetime.time
 import warnings
 from datetime import datetime, timezone, timedelta, time
 from pathlib import Path
@@ -82,8 +83,10 @@ DAILY_DD_LIMIT       = -0.04
 TOTAL_DD_LIMIT       = -0.08
 DAILY_LOSS_LIMIT     = 2       # halt after 2 losses in one day
 DAILY_PROFIT_TARGET  = 0.015   # bank gains and stop at +1.5% for the day
+TRAILING_DD_LIMIT    = 0.04    # prop firm trailing drawdown from intraday peak
 
-CORR_SYMBOL = "QQQ"   # NQ proxy for SMT divergence
+CORR_SYMBOL     = "QQQ"    # NQ proxy for SMT divergence
+ICT_ORDER_PREFIX = "ICT"   # client_order_id prefix — isolates ICT from Kronos orders
 
 # Hard time cutoffs — force-close any open ICT position at session end
 SESSION_CUTOFFS_ET = {
@@ -317,18 +320,20 @@ def translate_signal_to_spy(signal: dict, client) -> dict:
     return translated
 
 
-def save_state(signal: dict, shares: int) -> None:
-    """Persist SL/TP so subsequent runs can manage the open position."""
+def save_state(signal: dict, shares: int, equity: float, data_source: str) -> None:
+    """Persist SL/TP + metadata so subsequent runs can manage the position."""
     state = {
-        "symbol":     SYMBOL,
-        "signal":     signal["signal"],
-        "entry":      signal["entry"],
-        "sl":         signal["sl"],
-        "tp":         signal["tp"],
-        "shares":     shares,
-        "setup":      signal["setup"],
-        "kill_zone":  signal["kill_zone"],
-        "opened_at":  datetime.now().isoformat(),
+        "symbol":       SYMBOL,
+        "signal":       signal["signal"],
+        "entry":        signal["entry"],
+        "sl":           signal["sl"],
+        "tp":           signal["tp"],
+        "shares":       shares,
+        "setup":        signal["setup"],
+        "kill_zone":    signal["kill_zone"],
+        "opened_at":    datetime.now().isoformat(),
+        "data_source":  data_source,      # feed active when trade was opened
+        "peak_equity":  equity,           # tracks intraday high for trailing DD
     }
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(STATE_PATH, "w") as f:
@@ -367,22 +372,20 @@ def check_daily_dd(client: TradingClient) -> float:
 
 
 def count_daily_losses(client: TradingClient) -> int:
-    """Count stop-loss hits on SYMBOL today — each is one loss toward DAILY_LOSS_LIMIT."""
+    """
+    Estimate daily loss count from realized equity change.
+    Robust vs order-type string parsing (Alpaca fills stops as 'market' type).
+    Each loss ≈ RISK_PER_TRADE × equity.
+    """
     try:
-        from alpaca.trading.requests import GetOrdersRequest
-        from alpaca.trading.enums import QueryOrderStatus
-        today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        orders = client.get_orders(GetOrdersRequest(
-            status=QueryOrderStatus.CLOSED,
-            after=today,
-            symbols=[SYMBOL],
-            limit=50,
-        ))
-        return sum(
-            1 for o in orders
-            if str(getattr(o, "type", "")).lower() in ("stop", "stop_limit")
-            and str(getattr(o, "status", "")).lower() == "filled"
-        )
+        acct          = client.get_account()
+        eq            = float(acct.equity)
+        prev          = float(acct.last_equity)
+        daily_pnl     = eq - prev
+        if daily_pnl >= 0:
+            return 0
+        loss_per_trade = max(prev * RISK_PER_TRADE, 1.0)
+        return min(DAILY_LOSS_LIMIT + 1, int(abs(daily_pnl) / loss_per_trade))
     except Exception as e:
         log(f"[WARN] Could not count daily losses: {e}")
         return 0
@@ -404,6 +407,30 @@ def check_total_dd(client: TradingClient) -> float:
     except Exception as e:
         log(f"[WARN] Could not fetch portfolio history: {e}")
         return 0.0
+
+
+def check_trailing_dd(client: TradingClient, state: dict | None) -> float:
+    """
+    Prop firms (The5ers/FTMO) track trailing drawdown from intraday equity peak.
+    Returns drawdown % from the highest equity seen since the position opened.
+    """
+    if not state or "peak_equity" not in state:
+        return 0.0
+    current    = get_account_equity(client)
+    peak       = state["peak_equity"]
+    return (current - peak) / peak if peak > 0 else 0.0
+
+
+def update_peak_equity(client: TradingClient, state: dict) -> None:
+    """Update peak_equity in state file if current equity is higher."""
+    try:
+        current = get_account_equity(client)
+        if current > state.get("peak_equity", 0):
+            state["peak_equity"] = current
+            with open(STATE_PATH, "w") as f:
+                json.dump(state, f, indent=2)
+    except Exception:
+        pass
 
 
 def calc_position_size(equity: float, entry: float, sl: float,
@@ -438,7 +465,31 @@ def get_ict_position(client: TradingClient) -> dict | None:
     return None
 
 
+def cancel_ict_orders(client: TradingClient) -> None:
+    """Cancel all open orders for SYMBOL — removes bracket SL/TP orphans."""
+    try:
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+        orders = client.get_orders(GetOrdersRequest(
+            status=QueryOrderStatus.OPEN,
+            symbols=[SYMBOL],
+            limit=20,
+        ))
+        for o in orders:
+            try:
+                client.cancel_order_by_id(o.id)
+            except Exception:
+                pass
+        if orders:
+            _time.sleep(0.5)   # allow exchange to process cancellations
+            log(f"[CANCEL] Cancelled {len(orders)} open orders for {SYMBOL}")
+    except Exception as e:
+        log(f"[WARN] Could not cancel orders: {e}")
+
+
 def close_ict_position(client: TradingClient) -> None:
+    """Cancel bracket orders first, then close position — prevents double-close."""
+    cancel_ict_orders(client)
     try:
         client.close_position(SYMBOL)
         log(f"[CLOSE] Closed {SYMBOL} position")
@@ -505,14 +556,16 @@ def place_order(client: TradingClient, signal: dict, shares: int) -> None:
     sl   = round(signal["sl"], 2)
     tp   = round(signal["tp"], 2)
 
+    order_id = f"{ICT_ORDER_PREFIX}_{SYMBOL}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
     req = MarketOrderRequest(
-        symbol        = SYMBOL,
-        qty           = shares,
-        side          = side,
-        time_in_force = TimeInForce.DAY,
-        order_class   = OrderClass.BRACKET,
-        stop_loss     = StopLossRequest(stop_price=sl),
-        take_profit   = TakeProfitRequest(limit_price=tp),
+        symbol           = SYMBOL,
+        qty              = shares,
+        side             = side,
+        time_in_force    = TimeInForce.DAY,
+        order_class      = OrderClass.BRACKET,
+        stop_loss        = StopLossRequest(stop_price=sl),
+        take_profit      = TakeProfitRequest(limit_price=tp),
+        client_order_id  = order_id,
     )
     client.submit_order(req)
     log(f"[ORDER] {signal['signal']} {shares}x {SYMBOL} | {signal['reason']}")
@@ -574,15 +627,36 @@ def main() -> None:
     model = ICTModel(tf_minutes=5, fvg_min_pct=0.0002, rr_ratio=3.0, displacement_factor=1.5)
 
     # ── Existing position check ────────────────────────────────────────────
-    pos = get_ict_position(client)
+    pos   = get_ict_position(client)
+    state = load_state()
 
     if pos:
-        log(f"[POS] Existing ICT position: {pos['side']} {pos['qty']} {SYMBOL} — bracket orders managing SL/TP")
+        # Update intraday equity peak for trailing DD tracking
+        if state:
+            update_peak_equity(client, state)
+
+        # Trailing drawdown check (prop firm uses peak-to-trough, not daily open)
+        trailing_dd = check_trailing_dd(client, state)
+        if trailing_dd <= -TRAILING_DD_LIMIT:
+            log(f"[HALT] Trailing DD {trailing_dd:.2%} from intraday peak — prop firm protection")
+            send_telegram(f"⛔ ICT TRAILING DD: {trailing_dd:.2%} from peak — closing position")
+            close_ict_position(client)
+            clear_state()
+            return
+
+        log(f"[POS] Existing ICT position: {pos['side']} {pos['qty']} {SYMBOL} | Trailing DD: {trailing_dd:.2%}")
         manage_open_position(client, pos)
         return
 
-    # ── ICT signal generation ───────────────────────────────────────────────
+    # ── Data feed + signal ─────────────────────────────────────────────────
     df_5m, df_1h, df_corr, data_source = fetch_data()
+
+    # Data feed freeze: if source changed mid-session, don't open new positions
+    if state and state.get("data_source") and state["data_source"] != data_source:
+        log(f"[FREEZE] Data source changed mid-session ({state['data_source']} → {data_source}) — no new entries")
+        send_telegram(f"⚠️ ICT DATA FEED CHANGE: {state['data_source']} → {data_source} — entries frozen")
+        return
+
     signal = model.get_signal(df_5m, df_1h, df_correlated=df_corr)
 
     # Translate ES1! price levels → SPY prices when TradingView data was used
@@ -604,8 +678,9 @@ def main() -> None:
     cost = shares * signal["entry"]
     log(f"Position size: {shares} shares @ ${signal['entry']:.2f} = ${cost:,.2f}")
 
-    # ── Place bracket order — Alpaca manages SL/TP even when script is offline
+    # ── Place bracket order ─────────────────────────────────────────────────
     place_order(client, signal, shares)
+    save_state(signal, shares, equity, data_source)
 
     log("═" * 60)
 
