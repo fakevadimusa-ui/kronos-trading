@@ -223,11 +223,21 @@ def fetch_data_alpaca() -> tuple[pd.DataFrame | None, pd.DataFrame | None, pd.Da
         return None, None, None
 
 
+def _is_london_session() -> bool:
+    """True if current ET time is in London kill zone (3-5am ET)."""
+    now_et = datetime.now(ICTModel.ET).time()
+    return time(3, 0) <= now_et <= time(5, 0)
+
+
 def fetch_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None, str]:
     """
     Returns (df_5m, df_1h, df_correlated, data_source).
     df_correlated = QQQ/NQ1! 5m bars for SMT divergence.
     Priority: 1) TradingView ES1!+NQ1!  2) Alpaca API  3) yfinance
+
+    London session note: SPY IEX pre-market opens at 4am ET, not 3am.
+    During 3-4am London, only TradingView (ES1!) has live data.
+    Alpaca/yfinance are skipped for 3-4am to prevent stale bar analysis.
     """
     log(f"Fetching data — 1) TradingView {SIGNAL_SYMBOL}  2) Alpaca API  3) yfinance {SYMBOL}")
 
@@ -256,6 +266,12 @@ def fetch_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None, str]:
         return df_5m, df_1h, df_corr, "tradingview"
 
     # 2. Alpaca data API — SPY + QQQ
+    # Skip during 3-4am London: IEX pre-market opens at 4am ET, not 3am
+    # Using stale/empty pre-market bars would create false ICT setups
+    if _is_london_session() and datetime.now(ICTModel.ET).time() < time(4, 0):
+        log(f"[DATA] Skipping Alpaca/yfinance during 3-4am London — no SPY data yet (IEX opens 4am ET)")
+        return None, None, None, "insufficient"
+
     df_5m, df_1h, df_corr = fetch_data_alpaca()
     if df_5m is not None and len(df_5m) >= 60:
         log(f"[DATA] Alpaca API {SYMBOL} | 5m: {len(df_5m)} bars | last: {df_5m['close'].iloc[-1]:.2f} | SMT: {CORR_SYMBOL}")
@@ -726,6 +742,10 @@ def main() -> None:
 
     # ── Data feed + signal ─────────────────────────────────────────────────
     df_5m, df_1h, df_corr, data_source = fetch_data()
+
+    if data_source == "insufficient" or df_5m is None:
+        log("[SKIP] No actionable data for this session window — standing by")
+        return
 
     # Data feed freeze: if source changed mid-session, don't open new positions
     if state and state.get("data_source") and state["data_source"] != data_source:

@@ -47,11 +47,21 @@ class ICTModel:
         fvg_min_pct: float = 0.0002,
         rr_ratio: float = 3.0,
         displacement_factor: float = 1.5,
+        strict_filters: bool = True,
     ):
+        """
+        strict_filters=True  (default): all 15 filters active — A+ setups only.
+                                         Expected: 2-4 signals/month.
+        strict_filters=False (standard): inside-day and ATR gates relaxed,
+                                         AMD accumulation advisory only.
+                                         Expected: 10-15 signals/month.
+        Switch to False if paper testing shows too few signals to validate edge.
+        """
         self.tf_minutes          = tf_minutes
         self.fvg_min_pct         = fvg_min_pct
         self.rr_ratio            = rr_ratio
         self.displacement_factor = displacement_factor
+        self.strict_filters      = strict_filters
 
         # All windows auto-scale to keep consistent real-time coverage
         # regardless of entry timeframe (5m, 15m, etc.)
@@ -648,10 +658,14 @@ class ICTModel:
         base["kill_zone"] = kz
 
         # ── Edge conditions (volatility + inside day) ─────────────────────────
+        # strict_filters=False: log warning but don't block — trades B-grade setups
         edge_ok, edge_reason = self.check_edge_conditions(df_entry, df_1h)
         if not edge_ok:
-            base["reason"] = edge_reason
-            return base
+            if self.strict_filters:
+                base["reason"] = edge_reason
+                return base
+            else:
+                base["reason"] = f"[ADVISORY] {edge_reason} — strict_filters=False, continuing"
 
         # ── HTF bias ─────────────────────────────────────────────────────────
         htf_bias = self.get_htf_bias(df_1h)
@@ -660,8 +674,10 @@ class ICTModel:
         # ── AMD phase filter ──────────────────────────────────────────────────
         amd_phase = self.get_amd_phase(current_time_et)
         if amd_phase == "accumulation":
-            base["reason"] = f"AMD accumulation — marking range, no entries"
-            return base
+            if self.strict_filters:
+                base["reason"] = f"AMD accumulation — marking range, no entries"
+                return base
+            # strict_filters=False: allow entries even in accumulation phase
 
         # ── SMT divergence + Judas Swing / Trend Day ─────────────────────────
         # ── Phase transition ±2 min lock-out ─────────────────────────────────
