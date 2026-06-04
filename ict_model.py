@@ -81,7 +81,9 @@ class ICTModel:
         idx = []
         for i in range(n, len(highs) - n):
             window = np.concatenate([highs[i-n:i], highs[i+1:i+n+1]])
-            if highs[i] >= window.max():
+            # Strict > prevents double-tops from generating two swing highs
+            # at the same price, which caused false CHOCH signals.
+            if highs[i] > window.max():
                 idx.append(i)
         return idx
 
@@ -90,7 +92,8 @@ class ICTModel:
         idx = []
         for i in range(n, len(lows) - n):
             window = np.concatenate([lows[i-n:i], lows[i+1:i+n+1]])
-            if lows[i] <= window.min():
+            # Strict < prevents double-bottoms from generating false CHOCH signals.
+            if lows[i] < window.min():
                 idx.append(i)
         return idx
 
@@ -153,8 +156,11 @@ class ICTModel:
         closes = df["close"].values
         fvgs   = []
 
-        bodies     = np.abs(closes - opens)
-        avg_body   = np.convolve(bodies, np.ones(20) / 20, mode="same")
+        bodies   = np.abs(closes - opens)
+        # Causal rolling mean — uses only past data, no future leakage.
+        # np.convolve(mode='same') was centering the kernel, contaminating
+        # displacement labels at recent bars with bars that don't exist yet.
+        avg_body = pd.Series(bodies).rolling(window=20, min_periods=5).mean().values
 
         for i in range(2, len(df)):
             mid_body = bodies[i - 1]
@@ -162,29 +168,39 @@ class ICTModel:
 
             # Bullish FVG
             if lows[i] > highs[i - 2]:
-                size = (lows[i] - highs[i - 2]) / highs[i - 2]
+                size   = (lows[i] - highs[i - 2]) / highs[i - 2]
+                bottom = highs[i - 2]
+                top    = lows[i]
                 if size >= self.fvg_min_pct:
+                    # Mitigation: any close below the bottom after creation = zone spent
+                    mitigated = bool(np.any(closes[i + 1:] < bottom)) if i + 1 < len(df) else False
                     fvgs.append({
                         "idx":          i,
                         "type":         "BULL",
-                        "top":          lows[i],
-                        "bottom":       highs[i - 2],
-                        "mid":          (lows[i] + highs[i - 2]) / 2,
+                        "top":          top,
+                        "bottom":       bottom,
+                        "mid":          (top + bottom) / 2,
                         "size":         size,
                         "displacement": has_disp,
+                        "mitigated":    mitigated,
                     })
             # Bearish FVG
             elif highs[i] < lows[i - 2]:
-                size = (lows[i - 2] - highs[i]) / lows[i - 2]
+                size   = (lows[i - 2] - highs[i]) / lows[i - 2]
+                top    = lows[i - 2]
+                bottom = highs[i]
                 if size >= self.fvg_min_pct:
+                    # Mitigation: any close above the top after creation = zone spent
+                    mitigated = bool(np.any(closes[i + 1:] > top)) if i + 1 < len(df) else False
                     fvgs.append({
                         "idx":          i,
                         "type":         "BEAR",
-                        "top":          lows[i - 2],
-                        "bottom":       highs[i],
-                        "mid":          (lows[i - 2] + highs[i]) / 2,
+                        "top":          top,
+                        "bottom":       bottom,
+                        "mid":          (top + bottom) / 2,
                         "size":         size,
                         "displacement": has_disp,
+                        "mitigated":    mitigated,
                     })
 
         return fvgs
@@ -242,30 +258,96 @@ class ICTModel:
     # LIQUIDITY
     # ──────────────────────────────────────────────────────────────────────────
 
+    def _cluster_levels(self, levels: list[dict], tolerance: float) -> list[dict]:
+        """
+        Merge nearby price levels into clusters to eliminate the O(n²) duplicate
+        problem in detect_liquidity. Two levels are merged if they are within
+        2× tolerance of each other. The merged entry tracks touch count.
+        """
+        if not levels:
+            return []
+        sorted_lv = sorted(levels, key=lambda x: x["price"])
+        clustered  = [{**sorted_lv[0], "touches": 1}]
+        for lv in sorted_lv[1:]:
+            ref = clustered[-1]["price"]
+            if abs(lv["price"] - ref) / (ref + 1e-9) <= tolerance * 2:
+                # Merge into existing cluster — average price, accumulate touches
+                n_prev = clustered[-1]["touches"]
+                clustered[-1]["price"]   = (ref * n_prev + lv["price"]) / (n_prev + 1)
+                clustered[-1]["bars"]    = clustered[-1]["bars"] + lv.get("bars", [])
+                clustered[-1]["touches"] = n_prev + 1
+            else:
+                clustered.append({**lv, "touches": 1})
+        return clustered
+
     def detect_liquidity(self, df: pd.DataFrame, tolerance: float = 0.001) -> dict:
         """
         Scan last 50 bars for equal highs (sell-side) and equal lows (buy-side).
-        Also tags previous-session high/low as major liquidity.
+        Clusters nearby price levels so each pool is counted once, not once per
+        duplicate pair (the old O(n²) approach inflated pool significance).
+        Returns lists sorted by touch count — most contested levels first.
         """
         highs  = df["high"].values
         lows   = df["low"].values
         n      = min(50, len(df))
         recent = range(len(df) - n, len(df))
 
-        eq_highs, eq_lows = [], []
+        raw_highs, raw_lows = [], []
 
         for i in recent:
             for j in range(max(0, i - n), i):
                 if abs(highs[i] - highs[j]) / (highs[j] + 1e-9) <= tolerance:
-                    eq_highs.append({"price": (highs[i] + highs[j]) / 2, "bars": [j, i]})
+                    raw_highs.append({"price": (highs[i] + highs[j]) / 2, "bars": [j, i]})
                 if abs(lows[i] - lows[j]) / (lows[j] + 1e-9) <= tolerance:
-                    eq_lows.append({"price": (lows[i] + lows[j]) / 2, "bars": [j, i]})
+                    raw_lows.append({"price": (lows[i] + lows[j]) / 2, "bars": [j, i]})
 
-        # Strongest = most duplicate touches (dedup by price cluster)
+        eq_highs = sorted(self._cluster_levels(raw_highs, tolerance), key=lambda x: -x["touches"])
+        eq_lows  = sorted(self._cluster_levels(raw_lows,  tolerance), key=lambda x: -x["touches"])
+
         return {
-            "sell_side": eq_highs,   # equal highs → liquidity above (target for stop hunts before sell)
-            "buy_side":  eq_lows,    # equal lows  → liquidity below (target for stop hunts before buy)
+            "sell_side": eq_highs,   # equal highs → sell-side liquidity (stop hunts before sell)
+            "buy_side":  eq_lows,    # equal lows  → buy-side liquidity  (stop hunts before buy)
         }
+
+    def _has_liquidity_sweep(
+        self,
+        df:             pd.DataFrame,
+        direction:      str,
+        sweep_lookback: int = 10,
+    ) -> bool:
+        """
+        Returns True if a certified liquidity sweep occurred within the last
+        sweep_lookback bars — required ICT precondition for any FVG/OB entry.
+
+        Bullish sweep: price pierced below a buy-side equal-lows cluster within
+                       the lookback window, then current close has recovered above it.
+                       → institutions absorbed sell orders below the lows, reversal incoming.
+
+        Bearish sweep: price spiked above a sell-side equal-highs cluster within
+                       the lookback window, then current close pulled back below it.
+                       → institutions distributed into buy-stops above the highs.
+        """
+        if len(df) < sweep_lookback + 20:
+            return False
+
+        liquidity     = self.detect_liquidity(df)
+        current_price = float(df["close"].iloc[-1])
+        scan_lows     = df["low"].values[-(sweep_lookback + 1):-1]
+        scan_highs    = df["high"].values[-(sweep_lookback + 1):-1]
+
+        if direction == "bull":
+            for pool in liquidity["buy_side"]:
+                level = pool["price"]
+                if any(low < level for low in scan_lows) and current_price > level:
+                    return True
+
+        elif direction == "bear":
+            for pool in liquidity["sell_side"]:
+                level = pool["price"]
+                if any(high > level for high in scan_highs) and current_price < level:
+                    return True
+
+        return False
 
     # ──────────────────────────────────────────────────────────────────────────
     # KILL ZONES
@@ -339,21 +421,37 @@ class ICTModel:
         """
         if df_primary is None or df_correlated is None:
             return None
-        n = min(lookback, len(df_primary), len(df_correlated))
-        if n < 5:
+
+        # Enforce strict timestamp alignment before comparing bars.
+        # Raw [-n:] slices can reference different calendar times if SPY and QQQ
+        # have different bar counts (feed gaps, halts) — that produces false divergence.
+        try:
+            aligned_p, aligned_c = df_primary.align(df_correlated, join="inner", axis=0)
+        except Exception:
             return None
 
-        p_lows  = df_primary["low"].values[-n:]
-        c_lows  = df_correlated["low"].values[-n:]
-        p_highs = df_primary["high"].values[-n:]
-        c_highs = df_correlated["high"].values[-n:]
+        if len(aligned_p) < 5:
+            return None
 
-        # Bullish SMT: NQ new low, ES holds (NQ current low < all prior lows, ES current > its min)
-        if c_lows[-1] <= c_lows[:-1].min() and p_lows[-1] > p_lows[:-1].min():
+        n = min(lookback, len(aligned_p))
+
+        p_lows  = aligned_p["low"].values[-n:]
+        c_lows  = aligned_c["low"].values[-n:]
+        p_highs = aligned_p["high"].values[-n:]
+        c_highs = aligned_c["high"].values[-n:]
+
+        # Require a minimum magnitude for the new extreme to filter 1-tick noise.
+        # A new extreme must exceed the previous by at least 0.05% to count as SMT.
+        MIN_BREACH = 0.0005
+
+        # Bullish SMT: correlated (NQ/QQQ) sweeps a new n-bar low, primary (ES/SPY) holds
+        if (c_lows[-1] < c_lows[:-1].min() * (1 - MIN_BREACH)
+                and p_lows[-1] > p_lows[:-1].min()):
             return "bullish"
 
-        # Bearish SMT: NQ new high, ES holds lower
-        if c_highs[-1] >= c_highs[:-1].max() and p_highs[-1] < p_highs[:-1].max():
+        # Bearish SMT: correlated sweeps a new n-bar high, primary holds lower
+        if (c_highs[-1] > c_highs[:-1].max() * (1 + MIN_BREACH)
+                and p_highs[-1] < p_highs[:-1].max()):
             return "bearish"
 
         return None
@@ -596,6 +694,29 @@ class ICTModel:
     # HTF BIAS
     # ──────────────────────────────────────────────────────────────────────────
 
+    def _compute_atr14(self, df: pd.DataFrame) -> float:
+        """
+        ATR(14) on the entry timeframe.
+        Used for the adaptive SL cushion — replaces the static 0.1% fixed offset
+        which was blind to volatility regime (too tight on high-ATR days,
+        too loose on low-ATR days).
+        Falls back to 0.1% of current price if fewer than 15 bars available.
+        """
+        try:
+            h = df["high"].values
+            l = df["low"].values
+            c = df["close"].values
+            if len(df) < 15:
+                return float(c[-1]) * 0.001
+            tr = np.maximum.reduce([
+                h[1:] - l[1:],
+                np.abs(h[1:] - c[:-1]),
+                np.abs(l[1:] - c[:-1]),
+            ])
+            return float(tr[-14:].mean())
+        except Exception:
+            return float(df["close"].iloc[-1]) * 0.001
+
     def get_htf_bias(self, df_1h: pd.DataFrame) -> str:
         """Higher-timeframe directional bias from 1H market structure."""
         if df_1h is None or len(df_1h) < 20:
@@ -613,6 +734,7 @@ class ICTModel:
         df_1h:           Optional[pd.DataFrame] = None,
         df_correlated:   Optional[pd.DataFrame] = None,   # NQ1!/QQQ for SMT
         current_time_et: Optional[datetime]     = None,
+        df_1h_htf:       Optional[pd.DataFrame] = None,   # Futures 1H (ES=F) for HTF bias only
     ) -> dict:
         """
         Full ICT setup scan on entry timeframe with 1H bias filter.
@@ -668,7 +790,11 @@ class ICTModel:
                 base["reason"] = f"[ADVISORY] {edge_reason} — strict_filters=False, continuing"
 
         # ── HTF bias ─────────────────────────────────────────────────────────
-        htf_bias      = self.get_htf_bias(df_1h)
+        # Use futures 1H (ES=F / ES1!) if provided — captures overnight Globex
+        # structure that SPY RTH data misses (London kill zone, gap opens, etc.).
+        # PDH/PDL and edge conditions still use df_1h (SPY prices for execution).
+        _htf_source   = df_1h_htf if df_1h_htf is not None else df_1h
+        htf_bias      = self.get_htf_bias(_htf_source)
         base["htf_bias"] = htf_bias
         current_price = float(df_entry["close"].iloc[-1])
 
@@ -757,12 +883,33 @@ class ICTModel:
         # ── Entry timeframe structure ─────────────────────────────────────────
         structure, _ = self.detect_market_structure(df_entry)
 
-        # ── FVGs — scaled recency window ──────────────────────────────────────
+        # ── Adaptive SL cushion — 0.5 × ATR(14) ─────────────────────────────
+        # Replaces the static 0.1% fixed offset: blind to volatility regime.
+        # On a high-ATR session the static cushion was too tight and got wicked;
+        # on a low-ATR day it was excessive and reduced R:R unnecessarily.
+        _atr14       = self._compute_atr14(df_entry)
+        _sl_cushion  = 0.5 * _atr14
+
+        # ── FVGs — scaled recency window, mitigated zones excluded ───────────
         all_fvgs    = self.detect_fvg(df_entry)
-        recent_fvgs = [f for f in all_fvgs if f["idx"] > len(df_entry) - self.fvg_recency]
+        recent_fvgs = [
+            f for f in all_fvgs
+            if f["idx"] > len(df_entry) - self.fvg_recency
+            and not f.get("mitigated", False)   # skip zones already balanced by price
+        ]
 
         # Sort: displaced FVGs first, then by recency
         recent_fvgs.sort(key=lambda x: (-int(x["displacement"]), -x["idx"]))
+
+        # ── Liquidity sweep confirmation ───────────────────────────────────────
+        # ICT thesis: every valid setup is preceded by a stop-order hunt.
+        # strict_filters=True:  hard gate — no sweep → no entry.
+        # strict_filters=False: advisory only — logs but does not block.
+        SWEEP_LOOKBACK  = 10
+        bull_sweep_ok   = self._has_liquidity_sweep(df_entry, "bull", SWEEP_LOOKBACK)
+        bear_sweep_ok   = self._has_liquidity_sweep(df_entry, "bear", SWEEP_LOOKBACK)
+        sweep_bull_tag  = "" if bull_sweep_ok else " [NO_SWEEP]"
+        sweep_bear_tag  = "" if bear_sweep_ok else " [NO_SWEEP]"
 
         # ── OBs from last 5 structure events — scaled recency window ─────────
         recent_events = structure[-5:] if len(structure) >= 5 else structure
@@ -771,6 +918,11 @@ class ICTModel:
 
         # ── BULLISH setups ────────────────────────────────────────────────────
         if htf_bias in ("bull", "neutral"):
+            # Hard gate: require buy-side liquidity sweep when strict_filters=True
+            if self.strict_filters and not bull_sweep_ok:
+                base["reason"] = f"No buy-side liquidity sweep in last {SWEEP_LOOKBACK} bars — waiting for stop hunt | {kz} | HTF:{htf_bias}{smt_tag}"
+                return base
+
             for fvg in recent_fvgs:
                 if fvg["type"] != "BULL":
                     continue
@@ -778,7 +930,7 @@ class ICTModel:
                 if not (fvg["bottom"] <= current_price <= ote_top):
                     continue
                 entry    = current_price
-                sl       = fvg["bottom"] * (1 - 0.001)
+                sl       = fvg["bottom"] - _sl_cushion
                 risk     = entry - sl
                 if risk <= 0:
                     continue
@@ -797,7 +949,7 @@ class ICTModel:
                     "tp":     round(tp, 4),
                     "rr":     round((tp - entry) / risk, 2),
                     "setup":  "FVG" + unicorn.strip(),
-                    "reason": f"Bullish FVG{disp}{unicorn} [{fvg['bottom']:.2f}–{fvg['top']:.2f}] OTE≤{ote_top:.2f} | {kz} | HTF:{htf_bias}{smt_tag}{judas_tag}",
+                    "reason": f"Bullish FVG{disp}{unicorn} [{fvg['bottom']:.2f}–{fvg['top']:.2f}] OTE≤{ote_top:.2f} | {kz} | HTF:{htf_bias}{smt_tag}{judas_tag}{sweep_bull_tag}",
                 }
 
             for ob in sorted(recent_obs, key=lambda x: -x["idx"]):
@@ -806,7 +958,7 @@ class ICTModel:
                 if not (ob["bottom"] <= current_price <= ob["top"]):
                     continue
                 entry = current_price
-                sl    = ob["low"] * (1 - 0.001)
+                sl    = ob["low"] - _sl_cushion
                 risk  = entry - sl
                 if risk <= 0:
                     continue
@@ -818,11 +970,16 @@ class ICTModel:
                     "tp":     round(tp, 4),
                     "rr":     self.rr_ratio,
                     "setup":  "OB",
-                    "reason": f"Bullish OB [{ob['bottom']:.2f}–{ob['top']:.2f}] | {kz} | HTF:{htf_bias}{smt_tag}{judas_tag}",
+                    "reason": f"Bullish OB [{ob['bottom']:.2f}–{ob['top']:.2f}] | {kz} | HTF:{htf_bias}{smt_tag}{judas_tag}{sweep_bull_tag}",
                 }
 
         # ── BEARISH setups ────────────────────────────────────────────────────
         if htf_bias in ("bear", "neutral"):
+            # Hard gate: require sell-side liquidity sweep when strict_filters=True
+            if self.strict_filters and not bear_sweep_ok:
+                base["reason"] = f"No sell-side liquidity sweep in last {SWEEP_LOOKBACK} bars — waiting for stop hunt | {kz} | HTF:{htf_bias}{smt_tag}"
+                return base
+
             for fvg in recent_fvgs:
                 if fvg["type"] != "BEAR":
                     continue
@@ -830,7 +987,7 @@ class ICTModel:
                 if not (ote_bottom <= current_price <= fvg["top"]):
                     continue
                 entry   = current_price
-                sl      = fvg["top"] * (1 + 0.001)
+                sl      = fvg["top"] + _sl_cushion
                 risk    = sl - entry
                 if risk <= 0:
                     continue
@@ -849,7 +1006,7 @@ class ICTModel:
                     "tp":     round(tp, 4),
                     "rr":     round((entry - tp) / risk, 2),
                     "setup":  "FVG" + unicorn.strip(),
-                    "reason": f"Bearish FVG{disp}{unicorn} [{fvg['bottom']:.2f}–{fvg['top']:.2f}] OTE≥{ote_bottom:.2f} | {kz} | HTF:{htf_bias}{smt_tag}{judas_tag}",
+                    "reason": f"Bearish FVG{disp}{unicorn} [{fvg['bottom']:.2f}–{fvg['top']:.2f}] OTE≥{ote_bottom:.2f} | {kz} | HTF:{htf_bias}{smt_tag}{judas_tag}{sweep_bear_tag}",
                 }
 
             for ob in sorted(recent_obs, key=lambda x: -x["idx"]):
@@ -858,7 +1015,7 @@ class ICTModel:
                 if not (ob["bottom"] <= current_price <= ob["top"]):
                     continue
                 entry = current_price
-                sl    = ob["high"] * (1 + 0.001)
+                sl    = ob["high"] + _sl_cushion
                 risk  = sl - entry
                 if risk <= 0:
                     continue
@@ -870,7 +1027,7 @@ class ICTModel:
                     "tp":     round(tp, 4),
                     "rr":     self.rr_ratio,
                     "setup":  "OB",
-                    "reason": f"Bearish OB [{ob['bottom']:.2f}–{ob['top']:.2f}] | {kz} | HTF:{htf_bias}{smt_tag}{judas_tag}",
+                    "reason": f"Bearish OB [{ob['bottom']:.2f}–{ob['top']:.2f}] | {kz} | HTF:{htf_bias}{smt_tag}{judas_tag}{sweep_bear_tag}",
                 }
 
         base["reason"] = f"No ICT setup in {kz} kill zone | HTF:{htf_bias}"

@@ -60,6 +60,13 @@ SMA_PERIOD      = 20
 DAILY_DD_LIMIT  = -0.04
 TOTAL_DD_LIMIT  = -0.08
 
+# ── Kronos NVDA independent circuit breaker ──────────────────────────────────
+# Prevents NVDA intraday bleeding from contaminating the shared account equity
+# and forcing the ICT bot into its risk-halving regime.
+CB_LOSS_PCT  = 0.005   # 0.5% of total account equity
+CB_LOSS_ABS  = 400.0   # $400 absolute hard cap (whichever is smaller)
+CB_STATE_PATH = Path.home() / "freqtrade/user_data/logs/kronos_nvda_cb.json"
+
 KRONOS_MODEL_ID     = "NeoQuasar/Kronos-small"
 KRONOS_TOKENIZER_ID = "NeoQuasar/Kronos-Tokenizer-base"
 KRONOS_MAX_CONTEXT  = 512
@@ -98,6 +105,89 @@ def load_credentials() -> tuple[str, str]:
         cfg = json.load(f)
     ex = cfg["exchange"]
     return ex["key"], ex["secret"]
+
+
+def _cb_is_active() -> bool:
+    """Return True if the NVDA circuit breaker was tripped today."""
+    try:
+        if not CB_STATE_PATH.exists():
+            return False
+        with open(CB_STATE_PATH) as f:
+            state = json.load(f)
+        return state.get("date") == datetime.now().date().isoformat()
+    except Exception:
+        return False
+
+
+def _cb_activate(loss_dollars: float, equity: float) -> None:
+    """Persist circuit breaker state for today."""
+    try:
+        state = {
+            "date":              datetime.now().date().isoformat(),
+            "triggered_at":      datetime.now().isoformat(),
+            "loss_dollars":      round(loss_dollars, 2),
+            "equity_at_trigger": round(equity, 2),
+        }
+        CB_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(CB_STATE_PATH, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        log(f"[WARN] CB state write failed: {e}")
+
+
+def get_nvda_unrealized_loss(client: TradingClient) -> float:
+    """
+    Return current NVDA unrealized loss in dollars (positive = losing money).
+    Only the open position's live P&L — no approximations.
+    Returns 0 if no position is open.
+    """
+    try:
+        pos = client.get_open_position(SYMBOL)
+        return -float(pos.unrealized_pl)   # negate: negative unreal_pl = loss
+    except Exception:
+        return 0.0
+
+
+def check_and_trigger_circuit_breaker(client: TradingClient, equity: float) -> bool:
+    """
+    Check if NVDA's current unrealized loss exceeds the circuit breaker threshold.
+    If yes: flatten the position, write the CB state, send Telegram alert, return True.
+    If no:  return False (allow normal execution).
+    Wrapped in try/except — a CB failure must never crash the main script.
+    """
+    try:
+        if _cb_is_active():
+            log("[KRONOS CIRCUIT BREAKER ACTIVE] — all NVDA entries frozen until tomorrow")
+            return True
+
+        loss       = get_nvda_unrealized_loss(client)
+        threshold  = min(CB_LOSS_PCT * equity, CB_LOSS_ABS)
+
+        if loss < threshold:
+            return False   # within tolerance
+
+        log(f"[KRONOS CIRCUIT BREAKER] Loss ${loss:.2f} >= threshold ${threshold:.2f} ({loss/equity:.3%}) — freezing")
+
+        # Flatten open NVDA position
+        try:
+            client.close_position(SYMBOL)
+            log("[KRONOS CIRCUIT BREAKER] NVDA position closed — market order submitted")
+        except Exception as e:
+            log(f"[WARN] Could not close NVDA position: {e}")
+
+        _cb_activate(loss, equity)
+
+        send_telegram(
+            f"⛔ <b>KRONOS CIRCUIT BREAKER ACTIVE</b>\n"
+            f"NVDA unrealized loss: <b>${loss:.2f}</b> ({loss/equity:.3%})\n"
+            f"Threshold: ${threshold:.2f} | Account: ${equity:,.2f}\n"
+            f"All NVDA entries frozen until tomorrow."
+        )
+        return True
+
+    except Exception as e:
+        log(f"[WARN] Circuit breaker check failed ({e}) — allowing execution")
+        return False
 
 
 def load_kronos() -> KronosPredictor:
@@ -227,6 +317,12 @@ def main() -> None:
     account = client.get_account()
     equity  = float(account.equity)
     log(f"Alpaca paper account equity: ${equity:,.2f}")
+
+    # ── Kronos circuit breaker — must run before any other risk check ─────────
+    # If NVDA is bleeding intraday, freeze it before it trips the shared
+    # account's ICT risk halving threshold (-2% daily DD).
+    if check_and_trigger_circuit_breaker(client, equity):
+        return
 
     if not check_total_dd(client, account):
         msg = f"🚨 <b>NVDA | HALTED</b>\nTotal DD limit hit\nAccount: ${equity:,.0f}"
