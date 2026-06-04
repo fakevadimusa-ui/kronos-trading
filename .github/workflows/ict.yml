@@ -10,14 +10,15 @@ name: ICT Trading Bot
 # Free tier budget: ~560 runs/month × ~1 min = ~560 min (well under 2,000 limit).
 
 on:
-  schedule:
-    # London kill zone window (covers EDT + EST)
-    - cron: '0,15,30,45 7,8,9 * * 1-5'
-    # NY kill zone window (covers EDT + EST)
-    - cron: '0,15,30,45 11,12,13,14 * * 1-5'
-    # End-of-NY-session tick
-    - cron: '0 15 * * 1-5'
-  workflow_dispatch:   # manual trigger for testing
+  # ⛔ SCHEDULE DISABLED 2026-06-04 — dual-bot resolution.
+  # The VPS crontab (root@144.202.3.195) is now the SOLE ICT execution host.
+  # Auto-running here too would double-enter the same Alpaca account
+  # (two hunters, one deer). Re-enable ONLY after the VPS crontab is disabled.
+  # schedule:
+  #   - cron: '0,15,30,45 7,8,9 * * 1-5'        # London kill zone (EDT+EST)
+  #   - cron: '0,15,30,45 11,12,13,14 * * 1-5'  # NY kill zone (EDT+EST)
+  #   - cron: '0 15 * * 1-5'                     # End-of-NY-session tick
+  workflow_dispatch:   # manual trigger for testing only
 
 # Serialize runs: never let two ICT runs overlap (would risk a double entry).
 # cancel-in-progress: false = a newer run QUEUES behind the active one instead of
