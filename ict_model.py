@@ -668,8 +668,9 @@ class ICTModel:
                 base["reason"] = f"[ADVISORY] {edge_reason} — strict_filters=False, continuing"
 
         # ── HTF bias ─────────────────────────────────────────────────────────
-        htf_bias = self.get_htf_bias(df_1h)
+        htf_bias      = self.get_htf_bias(df_1h)
         base["htf_bias"] = htf_bias
+        current_price = float(df_entry["close"].iloc[-1])
 
         # ── AMD phase filter ──────────────────────────────────────────────────
         amd_phase = self.get_amd_phase(current_time_et)
@@ -733,9 +734,11 @@ class ICTModel:
                 return base
 
         # ── Midnight open premium/discount filter ─────────────────────────────
+        # strict_filters=True:  require buying in discount, selling in premium
+        # strict_filters=False: skip — trend days never retrace to midnight open;
+        #                        FVG/OB position handles confluence instead
         midnight_open = self.get_midnight_open(df_entry)
-        current_price = float(df_entry["close"].iloc[-1])
-        if midnight_open is not None:
+        if self.strict_filters and midnight_open is not None:
             in_discount = self.is_discount(current_price, midnight_open)
             in_premium  = self.is_premium(current_price, midnight_open)
             if htf_bias == "bull" and not in_discount:
@@ -780,10 +783,10 @@ class ICTModel:
                 if risk <= 0:
                     continue
                 tp       = entry + risk * self.rr_ratio
-                # PDH R:R gate: PDH must be beyond TP (target reachable)
-                if pdh and htf_bias == "bull" and pdh < tp:
-                    tp = min(tp, pdh)   # cap TP at PDH as Draw on Liquidity
-                    if (tp - entry) < risk:   # R:R < 1:1 — not worth it
+                # PDH R:R gate: PDH is above entry (valid draw) but below TP — cap at PDH
+                if pdh and htf_bias == "bull" and pdh > entry and pdh < tp:
+                    tp = min(tp, pdh)
+                    if (tp - entry) < risk:
                         continue
                 disp     = " [DISP]" if fvg["displacement"] else ""
                 unicorn  = " [UNICORN]" if self.detect_unicorn(fvg, recent_obs) else ""
@@ -832,7 +835,8 @@ class ICTModel:
                 if risk <= 0:
                     continue
                 tp      = entry - risk * self.rr_ratio
-                if pdl and htf_bias == "bear" and pdl > tp:
+                # PDL R:R gate: PDL is below entry (valid draw) but above TP — cap at PDL
+                if pdl and htf_bias == "bear" and pdl < entry and pdl > tp:
                     tp = max(tp, pdl)
                     if (entry - tp) < risk:
                         continue
