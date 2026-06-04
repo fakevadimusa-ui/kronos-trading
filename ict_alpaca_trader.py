@@ -637,15 +637,17 @@ def place_order(client: TradingClient, signal: dict, shares: int) -> None:
         symbol           = SYMBOL,
         qty              = shares,
         side             = side,
-        time_in_force    = TimeInForce.DAY,
+        time_in_force    = TimeInForce.GTC,
         order_class      = OrderClass.BRACKET,
         stop_loss        = StopLossRequest(stop_price=sl),
         take_profit      = TakeProfitRequest(limit_price=tp),
         client_order_id  = order_id,
     )
-    client.submit_order(req)
+    order = client.submit_order(req)
+    if order.status.value not in ("new", "pending_new", "accepted", "filled"):
+        raise RuntimeError(f"Order rejected by Alpaca: status={order.status.value} id={order.id}")
     log(f"[ORDER] {signal['signal']} {shares}x {SYMBOL} | {signal['reason']}")
-    log(f"        SL={sl} TP={tp} RR=1:{signal['rr']} (bracket order — Alpaca manages SL/TP)")
+    log(f"        SL={sl} TP={tp} RR=1:{signal['rr']} id={order.id}")
 
     msg = (
         f"<b>ICT {signal['signal']}</b> {SYMBOL}\n"
@@ -666,8 +668,9 @@ def main() -> None:
 
     # Load Alpaca client
     key, secret = load_credentials()
-    client      = TradingClient(key, secret, paper=True)
-    log("Alpaca paper client connected")
+    IS_PAPER    = os.environ.get("ALPACA_PAPER", "true").lower() == "true"
+    client      = TradingClient(key, secret, paper=IS_PAPER)
+    log(f"Alpaca {'PAPER' if IS_PAPER else 'LIVE'} client connected")
 
     # ── Priority 0: Session exit always runs first — bypasses all other logic ──
     # This prevents phase transition lock-outs from blocking session closes.
@@ -776,11 +779,12 @@ def main() -> None:
         return
 
     # ── Entry drift gate — skip if price moved too far from FVG entry ────────
-    current_px  = float(df_5m["close"].iloc[-1])
-    entry_drift = abs(current_px - signal["entry"]) / signal["entry"]
-    if entry_drift > MAX_ENTRY_DRIFT:
-        log(f"[SKIP] Entry drift {entry_drift:.3%} > {MAX_ENTRY_DRIFT:.3%} — price moved from FVG zone")
-        return
+    current_px = float(df_5m["close"].iloc[-1])
+    if data_source == "tradingview":   # drift only meaningful when translate_signal_to_spy used live price
+        entry_drift = abs(current_px - signal["entry"]) / signal["entry"]
+        if entry_drift > MAX_ENTRY_DRIFT:
+            log(f"[SKIP] Entry drift {entry_drift:.3%} > {MAX_ENTRY_DRIFT:.3%} — price moved from FVG zone")
+            return
 
     # ── Position sizing ─────────────────────────────────────────────────────
     shares = calc_position_size(equity, signal["entry"], signal["sl"], risk_pct)
@@ -792,8 +796,14 @@ def main() -> None:
     log(f"Position size: {shares} shares @ ${signal['entry']:.2f} = ${cost:,.2f}")
 
     # ── Place bracket order ─────────────────────────────────────────────────
-    place_order(client, signal, shares)
-    save_state(signal, shares, equity, data_source)
+    save_state(signal, shares, equity, data_source)   # save BEFORE submit — prevent orphan on crash
+    try:
+        place_order(client, signal, shares)
+    except Exception as e:
+        log(f"[ERROR] Order failed — clearing state: {e}")
+        clear_state()
+        send_telegram(f"❌ ICT ORDER FAILED: {e}")
+        return
 
     log("═" * 60)
 

@@ -35,7 +35,7 @@ def audit(text: str):
     # ── 1. STATE ────────────────────────────────────────────────
     errors    = [l for l in last50 if "Error" in l or "Exception" in l or "Traceback" in l]
     signals   = [l for l in last50 if "Signal:" in l]
-    orders    = [l for l in last50 if "Order submitted" in l or "Placing" in l]
+    orders    = [l for l in last50 if "[ORDER]" in l or "Order submitted" in l or "Placing" in l]
     kills     = [l for l in last50 if "kill zone" in l.lower()]
     holds     = [l for l in last50 if "HOLD" in l or "No ICT setup" in l]
     no_kz     = [l for l in last50 if "Not in kill zone" in l]
