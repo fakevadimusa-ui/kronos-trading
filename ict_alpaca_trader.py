@@ -30,6 +30,8 @@ Risk rules:
 
 from __future__ import annotations
 
+from typing import Optional
+
 import json
 import os
 import socket
@@ -44,8 +46,12 @@ import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
+from dotenv import load_dotenv
 
 warnings.filterwarnings("ignore")
+
+# Load .env from repo root so Telegram/Alpaca credentials are available in cron
+load_dotenv(Path(__file__).parent / ".env")
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -103,7 +109,29 @@ MAX_ENTRY_DRIFT  = 0.0015  # 0.15% — skip trade if price drifted too far from 
 ICT_TAG = "ICT"   # order tag to identify our positions vs Kronos positions
 
 # Session state — persists within a trading day, resets at midnight
-SESSION_STATE_PATH = Path.home() / "freqtrade/user_data/logs/ict_session.json"
+SESSION_STATE_PATH   = Path.home() / "freqtrade/user_data/logs/ict_session.json"
+# Security state — tracks last accepted bar + seen signal hashes (Bouncer + Decoy Detector)
+SECURITY_STATE_PATH  = Path.home() / "freqtrade/user_data/logs/ict_security_state.json"
+# Circuit breaker — date-stamped day-lock file written on 3rd consecutive loss
+DAY_LOCK_PATH        = Path.home() / "freqtrade/user_data/logs/ict_day_lock.json"
+# Write-once append loss log — immune to equity-recovery flickering from other bots
+ICT_LOSS_LOG_PATH    = Path.home() / "freqtrade/user_data/logs/ict_loss_log.jsonl"
+
+# Max consecutive losses before the circuit breaker physical padlock engages
+CIRCUIT_BREAKER_LOSSES = 3
+
+# ── Calibration Knobs — tune without touching logic ───────────────────────────
+# KNOB A: News windows — hard post-news floor (minutes always blocked after release)
+NEWS_HARD_POST_MINUTES  = 3      # range 2–5  | tighter=safer, looser=more setups
+
+# KNOB B: Circuit breaker — magnitude gate (combined loss vs avg win ratio)
+CB_MAGNITUDE_RATIO      = 2.5    # range 1.5–4.0 | lower=tighter, higher=more tolerant
+CB_MAX_LOSSES           = 6      # absolute ceiling — always locks out regardless of magnitude
+
+# KNOB C: Spread gate — Z-score thresholds and rolling window
+SPREAD_Z_THRESHOLD      = 0.5    # range 0.3–0.8 | lower=tighter, higher=more tolerant
+SPREAD_Z_SOFT           = 1.0    # used during post-news soft window
+SPREAD_HISTORY_SIZE     = 20     # samples for rolling baseline
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -113,6 +141,537 @@ SESSION_STATE_PATH = Path.home() / "freqtrade/user_data/logs/ict_session.json"
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL 1 — THE NEWS BLACKOUT CLOCK (Embargo Window)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Two-phase news windows ────────────────────────────────────────────────────
+# Hard phase: always blocked — covers pre-news liquidity pullback AND the first
+# NEWS_HARD_POST_MINUTES of genuine price-discovery chaos after release.
+# Soft phase: blocked only if spread is still abnormally elevated vs baseline.
+#   Self-expires the moment the market normalizes — zero extra API calls (reuses
+#   the spread gate that already runs before every order submission).
+
+_EMBARGO_HARD_ET = [
+    (time(8, 15),  time(8, 33)),   # CPI/PPI/NFP: -15min pre + 3min post
+    (time(9, 25),  time(9, 32)),   # Market open: -5min pre  + 2min post
+    (time(13, 45), time(14, 3)),   # FOMC:        -15min pre + 3min post
+]
+_EMBARGO_SOFT_ET = [
+    (time(8, 33),  time(8, 45)),   # CPI/PPI/NFP: up to 12min post (spread-gated)
+    (time(9, 32),  time(9, 35)),   # Market open: up to 3min post  (spread-gated)
+    (time(14, 3),  time(14, 15)),  # FOMC:        up to 12min post (spread-gated)
+]
+
+def is_embargo_active(dt_et=None) -> bool:
+    """
+    Two-phase embargo — calibrated to minimize opportunity cost:
+
+    Hard phase: absolute block. Pre-news liquidity vacuum + first 3 min of
+    post-release chaos. Cannot be overridden by spread normalization.
+
+    Soft phase: conditional block. Stays active only while spread is elevated
+    above Z-score threshold (spread gate reused, no extra API call).
+    Clears automatically when the market returns to normal microstructure.
+    """
+    t = (dt_et or datetime.now(ICTModel.ET)).time()
+
+    # Hard phase — always blocked
+    if any(s <= t <= e for s, e in _EMBARGO_HARD_ET):
+        return True
+
+    # Soft phase — blocked only if spread is still abnormal
+    if any(s <= t <= e for s, e in _EMBARGO_SOFT_ET):
+        spread_normal = check_spread_gate(None, SYMBOL, soft_mode=True)
+        if not spread_normal:
+            log("[EMBARGO-SOFT] Post-news spread still elevated — window held")
+            return True
+        log("[EMBARGO-SOFT] Spread normalized — window cleared early")
+    return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL 2 — THE PHYSICAL PADLOCK (Day-Lock Circuit Breaker)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def is_day_locked() -> bool:
+    """
+    Checks the physical day-lock file on disk.
+    Returns True if a lock exists for today — caller should sys.exit(0).
+    File is date-stamped so it auto-expires at midnight with no cleanup needed.
+    """
+    try:
+        if not DAY_LOCK_PATH.exists():
+            return False
+        with open(DAY_LOCK_PATH) as f:
+            lock = json.load(f)
+        if lock.get("locked_date") == datetime.now().date().isoformat():
+            log(f"[PADLOCK] Circuit breaker active — locked at {lock.get('locked_at')} | "
+                f"Reason: {lock.get('reason')} | Unlock after: {lock.get('unlock_after')}")
+            return True
+    except Exception as e:
+        log(f"[WARN] Day-lock file unreadable ({e}) — allowing execution")
+    return False
+
+
+def engage_day_lock(reason: str, loss_count: int) -> None:
+    """
+    Writes the physical padlock file to disk and fires a Telegram alert.
+    Called when loss_count reaches CIRCUIT_BREAKER_LOSSES.
+    The unlock_after timestamp is set to next trading day 09:30 ET so a
+    midnight cron overlap cannot accidentally bypass a lock set at 23:59.
+    """
+    today     = datetime.now()
+    next_open = (today.date() + timedelta(days=1)).isoformat() + " 09:30:00 ET"
+    lock = {
+        "locked_date":  today.date().isoformat(),
+        "locked_at":    today.isoformat(),
+        "reason":       reason,
+        "losses_today": loss_count,
+        "unlock_after": next_open,
+    }
+    try:
+        DAY_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(DAY_LOCK_PATH, "w") as f:
+            json.dump(lock, f, indent=2)
+        log(f"[PADLOCK] Day-lock engaged — {reason}")
+        send_telegram(
+            f"🔒 <b>ICT CIRCUIT BREAKER ENGAGED</b>\n"
+            f"Reason: {reason}\n"
+            f"Consecutive losses: {loss_count}\n"
+            f"All entries locked until: {next_open}"
+        )
+    except Exception as e:
+        log(f"[WARN] Could not write day-lock file: {e}")
+
+
+# ── Loss Append Log — immune to equity-recovery flickering ──────────────────
+
+def record_ict_loss(pnl_dollars: float, reason: str) -> int:
+    """
+    Appends one JSON line to the write-once loss log when an ICT trade closes
+    in the red. Returns today's total ICT loss count after recording.
+
+    This is completely independent of account equity — other bots winning
+    money cannot reset or confuse this counter. One line = one loss, always.
+    """
+    today = datetime.now().date().isoformat()
+    entry = {
+        "date":   today,
+        "ts":     datetime.now().isoformat(),
+        "pnl":    round(pnl_dollars, 2),
+        "reason": reason,
+    }
+    try:
+        ICT_LOSS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(ICT_LOSS_LOG_PATH, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        log(f"[WARN] Loss log write failed: {e}")
+    total = count_ict_losses_today()
+    log(f"[LOSS LOG] Recorded loss ${pnl_dollars:+.2f} | Total ICT losses today: {total}/{CIRCUIT_BREAKER_LOSSES}")
+    return total
+
+
+def record_ict_win(pnl_dollars: float) -> None:
+    """
+    Appends a win entry to the same loss log file.
+    Used by get_avg_ict_win() to calibrate the magnitude circuit breaker.
+    """
+    today = datetime.now().date().isoformat()
+    entry = {"date": today, "ts": datetime.now().isoformat(),
+             "pnl": round(pnl_dollars, 2), "type": "win"}
+    try:
+        ICT_LOSS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(ICT_LOSS_LOG_PATH, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        log(f"[WARN] Win log write failed: {e}")
+
+
+def get_avg_ict_win(lookback_days: int = 10) -> float:
+    """
+    Returns the average ICT winning trade size over the last lookback_days.
+    Falls back to a conservative $50 estimate if no win history exists.
+    Used to calibrate the magnitude threshold in the circuit breaker.
+    """
+    try:
+        if not ICT_LOSS_LOG_PATH.exists():
+            return 50.0
+        wins = []
+        with open(ICT_LOSS_LOG_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    if entry.get("type") == "win" and entry.get("pnl", 0) > 0:
+                        wins.append(float(entry["pnl"]))
+                except json.JSONDecodeError:
+                    continue
+        return sum(wins[-lookback_days:]) / len(wins[-lookback_days:]) if wins else 50.0
+    except Exception:
+        return 50.0
+
+
+def check_circuit_breaker_magnitude(daily_losses: int) -> bool:
+    """
+    Magnitude-weighted circuit breaker — prevents lockout from small noise losses.
+
+    Trips only when BOTH conditions are true:
+    1. Count gate:     daily_losses >= CIRCUIT_BREAKER_LOSSES
+    2. Magnitude gate: combined recent loss damage > avg_win * CB_MAGNITUDE_RATIO
+
+    Hard ceiling: always trips at CB_MAX_LOSSES regardless of magnitude.
+
+    Rationale: 3 losses of $8/$9/$7 on a choppy day is market noise.
+    3 losses of $180/$160/$200 on a calm day means the edge is broken.
+    The count alone cannot distinguish the two.
+    """
+    if daily_losses >= CB_MAX_LOSSES:
+        log(f"[CB-MAGNITUDE] Hard ceiling hit ({daily_losses} >= {CB_MAX_LOSSES}) — locking out")
+        return True
+
+    if daily_losses < CIRCUIT_BREAKER_LOSSES:
+        return False
+
+    # Read recent losses from append log
+    today = datetime.now().date().isoformat()
+    recent_loss_pnls = []
+    try:
+        if ICT_LOSS_LOG_PATH.exists():
+            with open(ICT_LOSS_LOG_PATH) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        if (entry.get("date") == today
+                                and entry.get("pnl", 0) < 0
+                                and entry.get("type") != "win"):
+                            recent_loss_pnls.append(abs(float(entry["pnl"])))
+                    except json.JSONDecodeError:
+                        continue
+    except Exception:
+        pass
+
+    if not recent_loss_pnls:
+        # No loss records yet — fall back to count-only
+        return True
+
+    total_damage = sum(recent_loss_pnls[-CIRCUIT_BREAKER_LOSSES:])
+    avg_win      = get_avg_ict_win()
+    threshold    = avg_win * CB_MAGNITUDE_RATIO
+
+    if total_damage > threshold:
+        log(f"[CB-MAGNITUDE] TRIPS — damage ${total_damage:.2f} > threshold ${threshold:.2f} "
+            f"(avg_win=${avg_win:.2f} × {CB_MAGNITUDE_RATIO})")
+        return True
+
+    log(f"[CB-MAGNITUDE] Count limit hit but magnitude OK — "
+        f"${total_damage:.2f} damage < ${threshold:.2f} threshold — noise, not system failure")
+    return False
+
+
+def count_ict_losses_today() -> int:
+    """
+    Counts today's ICT losses from the append log.
+    Reads the flat file and counts lines matching today's date.
+    Zero equity math — cannot be affected by Kronos NVDA or any other bot.
+    """
+    today = datetime.now().date().isoformat()
+    try:
+        if not ICT_LOSS_LOG_PATH.exists():
+            return 0
+        count = 0
+        with open(ICT_LOSS_LOG_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    if entry.get("date") == today and entry.get("pnl", 0) < 0:
+                        count += 1
+                except json.JSONDecodeError:
+                    continue
+        return count
+    except Exception as e:
+        log(f"[WARN] Loss log read failed ({e}) — returning 0")
+        return 0
+
+
+# ── Broker-first loss truth — authoritative SAFETY-CHECK count ────────────────
+# The log-based count_ict_losses_today() above still feeds the magnitude gate and
+# the audit trail (KEEP LOGS). For the actual circuit-breaker SAFETY decision we
+# use Alpaca's own order history as the source of truth: it cannot desync from the
+# broker, it survives a missed record_ict_loss() write, and it needs ZERO local
+# state (identical result on the VPS and on an ephemeral GitHub runner).
+
+def _et_session_start_utc() -> datetime:
+    """Start of the current ET trading day (00:00 ET) as tz-aware UTC. Clock-derived,
+    no local file — identical on every host. ICT kill zones all fall after 00:00 ET."""
+    et_now      = datetime.now(ICTModel.ET)
+    et_midnight = ICTModel.ET.localize(datetime.combine(et_now.date(), time(0, 0)))
+    return et_midnight.astimezone(timezone.utc)
+
+
+def _ict_realized_trades_today(client: TradingClient) -> list[float]:
+    """
+    Reconstruct today's CLOSED ICT round-trips from Alpaca order history.
+    SPY is ICT-exclusive on this account (Kronos=NVDA/USO), so every filled SPY
+    order today is ICT. Walk fills in fill-time order — bracket legs share their
+    parent's created_at, so we MUST sort by filled_at, never created_at — accumulate
+    signed cash, and snapshot realized P&L each time net position returns flat.
+    Exit-path agnostic: counts bracket SL/TP fills AND manual time-exit closes.
+    """
+    orders = client.get_orders(filter=GetOrdersRequest(
+        status  = QueryOrderStatus.ALL,
+        after   = _et_session_start_utc(),
+        symbols = [SYMBOL],
+        limit   = 500,
+    ))
+    fills = [o for o in orders
+             if o.filled_at is not None
+             and o.filled_qty is not None and float(o.filled_qty) > 0
+             and o.filled_avg_price is not None]
+    fills.sort(key=lambda o: o.filled_at)
+
+    trades: list[float] = []
+    pos_qty = 0.0   # signed shares held within the currently-open round-trip
+    cash    = 0.0   # signed cash flow of that round-trip (+ received, - spent)
+    for o in fills:
+        qty    = float(o.filled_qty)
+        px     = float(o.filled_avg_price)
+        signed = qty if o.side == OrderSide.BUY else -qty
+        cash  -= signed * px        # buy spends cash (-), sell receives cash (+)
+        pos_qty += signed
+        if abs(pos_qty) < 1e-9:     # net flat → one round-trip realized
+            trades.append(cash)
+            cash = 0.0
+    return trades
+
+
+def count_ict_losses_today_broker(client: TradingClient) -> int:
+    """
+    Authoritative count of today's LOSING ICT round-trips, derived from the broker.
+    Used for the circuit-breaker SAFETY gate. No try/except — a query failure
+    propagates so the caller HALTS rather than silently assuming zero losses.
+    """
+    return sum(1 for pnl in _ict_realized_trades_today(client) if pnl < 0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL 3 — THE SPREAD SMOKE DETECTOR (NBBO Spread Gate)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Absolute fallback cap (5bp) — used during cold start while history builds.
+# Primary gate is now Z-score relative, so this rarely fires in normal operation.
+_MAX_SPREAD_PCT  = 0.0005
+
+# Disk-backed spread history — survives across cron ticks so Z-score baseline
+# never resets to cold-start. Cache path mirrors the session/security state paths.
+_SPREAD_CACHE_PATH = Path.home() / "freqtrade/user_data/logs/ict_spread_cache.json"
+_current_spread: Optional[float] = None
+
+# Load history from disk at startup so Z-score baseline persists across ticks.
+_spread_history: list[float] = []
+try:
+    if _SPREAD_CACHE_PATH.exists():
+        with open(_SPREAD_CACHE_PATH) as _f:
+            _spread_history = json.load(_f).get("history", [])[-20:]  # cap at SPREAD_HISTORY_SIZE
+except Exception:
+    pass
+
+def refresh_spread_baseline() -> None:
+    """
+    Fetches NBBO quote once per cron tick. Both is_embargo_active() (Knob A soft phase)
+    and check_spread_gate() (Knob C) read from _spread_history after this runs.
+    One API call per tick, zero redundant fetches.
+    Call this in main() BEFORE is_embargo_active().
+    """
+    global _spread_history, _current_spread
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockLatestQuoteRequest
+        key, secret = load_credentials()
+        data_client = StockHistoricalDataClient(key, secret)
+        q = data_client.get_stock_latest_quote(
+            StockLatestQuoteRequest(symbol_or_symbols=SYMBOL)
+        )[SYMBOL]
+        if q.ask_price <= 0: log("[BASELINE] Market closed — no NBBO (ask=0), skipping"); return
+        spread_pct = (q.ask_price - q.bid_price) / q.ask_price
+        _current_spread = spread_pct
+        _spread_history.append(spread_pct)
+        if len(_spread_history) > SPREAD_HISTORY_SIZE:
+            _spread_history.pop(0)
+        # Persist to disk so Z-score baseline survives across cron ticks
+        _SPREAD_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_SPREAD_CACHE_PATH, "w") as f:
+            json.dump({"history": _spread_history, "ts": datetime.now().isoformat()}, f)
+        log(f"[BASELINE] Spread {spread_pct:.5%} | history={len(_spread_history)}/{SPREAD_HISTORY_SIZE}")
+    except Exception as e:
+        log(f"[WARN] Spread baseline refresh failed ({e}) — using stale history")
+
+
+def check_spread_gate(client, symbol: str = SYMBOL,
+                      soft_mode: bool = False) -> bool:
+    """
+    Volatility-adjusted NBBO spread gate.
+
+    Instead of a fixed 5bp threshold (blind to context), compares the current
+    spread against a rolling baseline of recent quotes using a Z-score:
+        spread_z = (current_spread - median_baseline) / median_baseline
+
+    When spread_z > SPREAD_Z_THRESHOLD (default 0.5 = 50% above baseline):
+        → gate fires, trade aborted
+
+    This means NY open naturally-wide spreads do NOT trigger the gate, because
+    the rolling median is also wide during that window. Only a sudden *relative*
+    spike (news, flash crash) causes the Z-score to cross threshold.
+
+    soft_mode=True: uses SPREAD_Z_SOFT (more lenient) — called by the post-news
+    soft embargo window to decide whether to clear early.
+
+    Fail-open: always returns True on API failure. Gate error ≠ blocked trade.
+    """
+    global _spread_history, _current_spread
+    try:
+        if _current_spread is None:
+            log("[SMOKE DETECTOR] No spread data yet — refresh_spread_baseline() not called, fail-open")
+            return True
+
+        spread_pct = _current_spread
+        threshold = SPREAD_Z_SOFT if soft_mode else SPREAD_Z_THRESHOLD
+
+        if len(_spread_history) >= 5:
+            import statistics
+            baseline  = statistics.median(_spread_history[:-1])
+            spread_z  = (spread_pct - baseline) / baseline if baseline > 0 else 0.0
+            if spread_z > threshold:
+                log(f"[SMOKE DETECTOR] Spread {spread_pct:.5%} | Z={spread_z:.2f} > {threshold} | baseline {baseline:.5%} — aborted")
+                return False
+            log(f"[SMOKE DETECTOR] Spread {spread_pct:.5%} | Z={spread_z:.2f} | baseline {baseline:.5%} — cleared")
+        else:
+            if spread_pct > _MAX_SPREAD_PCT:
+                log(f"[SMOKE DETECTOR] Cold-start: {spread_pct:.5%} > {_MAX_SPREAD_PCT:.5%} — aborted")
+                return False
+            log(f"[SMOKE DETECTOR] Cold-start: {spread_pct:.5%} — cleared ({len(_spread_history)}/5 samples)")
+        return True
+    except Exception as e:
+        log(f"[WARN] Spread gate check failed ({e}) — fail-open")
+        return True
+
+
+# ── GUARD 1 + 2: The Bouncer & The Decoy Detector ───────────────────────────
+
+def _load_security_state() -> dict:
+    try:
+        if SECURITY_STATE_PATH.exists():
+            with open(SECURITY_STATE_PATH) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {"last_bar_ts": "", "seen_hashes": []}
+
+
+def _save_security_state(state: dict) -> None:
+    try:
+        SECURITY_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(SECURITY_STATE_PATH, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        log(f"[WARN] Security state write failed: {e}")
+
+
+def is_signal_valid(side: str, symbol: str, bar_ts: str) -> bool:
+    """
+    Guard 1 — The Bouncer: rejects signals from a bar that's already been
+    processed. On a cron-based bot, this prevents re-entering the same FVG
+    setup if the 5m bar hasn't changed between two consecutive runs.
+
+    Guard 2 — The Decoy Detector: SHA256 content-addresses every signal.
+    If the same symbol+side+bar_ts combination has already been acted on,
+    the duplicate is silently dropped. Survives crashes and restarts.
+    Keeps only the last 100 hashes so the file stays lightweight.
+    """
+    import hashlib
+    state = _load_security_state()
+
+    # Guard 1: Bouncer — bar must be newer than the last accepted bar
+    if bar_ts and bar_ts <= state["last_bar_ts"]:
+        log(f"[BOUNCER] Signal dropped — bar {bar_ts} already processed (last: {state['last_bar_ts']})")
+        return False
+
+    # Guard 2: Decoy Detector — content-address this exact signal
+    signal_hash = hashlib.sha256(f"{symbol}|{side}|{bar_ts}".encode()).hexdigest()[:16]
+    if signal_hash in state["seen_hashes"]:
+        log(f"[DECOY DETECTOR] Duplicate signal dropped — hash {signal_hash} already executed")
+        return False
+
+    # Passed both guards — update state
+    state["last_bar_ts"] = bar_ts
+    state["seen_hashes"].append(signal_hash)
+    if len(state["seen_hashes"]) > 100:
+        state["seen_hashes"].pop(0)
+    _save_security_state(state)
+    log(f"[SIGNAL VERIFIED] {side} on bar {bar_ts} | hash {signal_hash} — cleared for execution")
+    return True
+
+
+# ── GUARD 3: The Orphan Reaper ────────────────────────────────────────────────
+
+def orphan_reaper(client: TradingClient) -> None:
+    """
+    Runs at the top of every cron tick. Fetches all open SYMBOL orders from
+    Alpaca and checks for orphaned stop-loss orders whose take-profit partner
+    has already filled. This happens when TP hits while the script is between
+    runs — Alpaca auto-closes the position but the SL remains as a ghost.
+
+    Pattern: if open SL exists but no open TP partner → TP already hit →
+    cancel the ghost SL and flatten any residual position.
+
+    Wrapped in try/except — a reaper failure must never block a live trade.
+    """
+    try:
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+
+        open_orders = client.get_orders(GetOrdersRequest(
+            status=QueryOrderStatus.OPEN,
+            symbols=[SYMBOL],
+            limit=20,
+        ))
+
+        sl_orders = [o for o in open_orders
+                     if getattr(o, "type", None) and o.type.value in ("stop", "stop_limit")]
+        tp_orders = [o for o in open_orders
+                     if getattr(o, "type", None) and o.type.value == "limit"]
+
+        if sl_orders and not tp_orders:
+            log(f"[ORPHAN REAPER] Ghost SL detected — TP already filled, {len(sl_orders)} orphan(s) found")
+            for sl in sl_orders:
+                try:
+                    client.cancel_order_by_id(sl.id)
+                    log(f"[ORPHAN REAPER] Cancelled ghost SL id={sl.id}")
+                except Exception as e:
+                    log(f"[WARN] Could not cancel ghost SL {sl.id}: {e}")
+            try:
+                client.close_position(SYMBOL)
+                log(f"[ORPHAN REAPER] Position flattened — account clean")
+            except Exception:
+                log(f"[ORPHAN REAPER] Position already flat")
+            send_telegram(
+                f"👻 <b>ORPHAN REAPER</b>\n"
+                f"Ghost SL cancelled ({len(sl_orders)} order(s))\n"
+                f"TP had already filled — position flattened cleanly."
+            )
+    except Exception as e:
+        log(f"[WARN] Orphan Reaper scan failed ({e}) — continuing")
 
 
 def send_telegram(msg: str) -> None:
@@ -301,6 +860,53 @@ def fetch_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None, str]:
     return df_5m, df_1h, df_corr, "yfinance"
 
 
+def fetch_htf_futures_1h() -> pd.DataFrame | None:
+    """
+    Fetch 60 days of 1H bars for ES=F (S&P 500 continuous futures) from yfinance.
+    Used ONLY for the HTF trend-bias calculation — NOT for execution or PDH/PDL.
+    ES=F trades 24/7 so it captures the overnight Globex structure (London kill
+    zone lows, gap opens) that SPY RTH data never sees.
+    Returns None on failure — model gracefully falls back to SPY 1H bias.
+    """
+    try:
+        df = yf.download("ES=F", period="60d", interval="1h",
+                         auto_adjust=True, progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df.columns = [str(c).lower() for c in df.columns]
+        df = df.dropna()
+        if len(df) < 20:
+            log("[WARN] ES=F HTF: too few bars — falling back to SPY 1H bias")
+            return None
+        log(f"[HTF] ES=F 1H futures: {len(df)} bars | last: {df['close'].iloc[-1]:.2f}")
+        return df
+    except Exception as e:
+        log(f"[WARN] ES=F HTF fetch failed ({e}) — falling back to SPY 1H bias")
+        return None
+
+
+def fetch_live_price(client: TradingClient) -> float | None:
+    """
+    Fetch the absolute latest SPY trade price from Alpaca at the exact moment
+    of order submission. Used for both the entry drift gate and position sizing
+    so our risk footprint is accurate to the second, not to the last 5m close
+    (which can be 1–4 minutes stale — $0.30–$0.80 off during NY open).
+    Returns None on failure; callers fall back to the signal entry price.
+    """
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockLatestTradeRequest
+        key, secret = load_credentials()
+        data_client = StockHistoricalDataClient(key, secret)
+        resp        = data_client.get_stock_latest_trade(
+            StockLatestTradeRequest(symbol_or_symbols=SYMBOL)
+        )
+        return float(resp[SYMBOL].price)
+    except Exception as e:
+        log(f"[WARN] Live price fetch failed ({e}) — using signal entry price")
+        return None
+
+
 def translate_signal_to_spy(signal: dict, client) -> dict:
     """
     Convert ES1! entry/sl/tp prices to SPY prices for Alpaca bracket orders.
@@ -342,15 +948,8 @@ def translate_signal_to_spy(signal: dict, client) -> dict:
     return translated
 
 
-def save_state(signal: dict, shares: int, data_source: str) -> None:
-    """
-    Persist position-management metadata (time-exit / stagnation / feed-freeze).
-
-    NOTE: this file is NOT used for risk management any more — daily losses and
-    trailing DD are now broker-derived (see count_daily_losses / check_trailing_dd).
-    It is still local-file based for position management, which remains ephemeral
-    on GitHub Actions (flagged for migration in the next cycle).
-    """
+def save_state(signal: dict, shares: int, equity: float, data_source: str) -> None:
+    """Persist SL/TP + metadata so subsequent runs can manage the position."""
     state = {
         "symbol":       SYMBOL,
         "signal":       signal["signal"],
@@ -362,6 +961,8 @@ def save_state(signal: dict, shares: int, data_source: str) -> None:
         "kill_zone":    signal["kill_zone"],
         "opened_at":    datetime.now().isoformat(),
         "data_source":  data_source,      # feed active when trade was opened
+        "entry_equity": equity,           # frozen at entry — used for exit P&L calculation
+        "peak_equity":  equity,           # tracks intraday high for trailing DD
     }
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(STATE_PATH, "w") as f:
@@ -403,6 +1004,21 @@ def _save_session(s: dict) -> None:
         json.dump(s, f, indent=2)
 
 
+def get_ict_session_start_equity(client: TradingClient) -> float:
+    """
+    Return today's ICT-isolated starting equity.
+    First call of the day records current equity as baseline so Kronos
+    losses from other sessions don't contaminate ICT's daily loss count.
+    """
+    s = _load_session()
+    if "ict_start_equity" in s:
+        return float(s["ict_start_equity"])
+    eq = get_account_equity(client)
+    s["ict_start_equity"] = eq
+    _save_session(s)
+    return eq
+
+
 def get_trend_day_bypass(kill_zone: str) -> bool:
     """Return True if trend day bypass was already triggered this session."""
     return bool(_load_session().get(f"trend_bypass_{kill_zone}", False))
@@ -425,116 +1041,140 @@ def get_account_equity(client: TradingClient) -> float:
 
 
 def check_daily_dd(client: TradingClient) -> float:
-    """Returns today's PnL % vs last_equity."""
-    acct = client.get_account()
-    eq   = float(acct.equity)
-    prev = float(acct.last_equity)
+    """
+    Returns ICT-isolated daily PnL % vs ICT session start equity.
+    Uses get_ict_session_start_equity() — not Alpaca's last_equity — so losses
+    from Kronos or other bots running earlier in the day don't consume ICT's
+    daily drawdown budget.
+    """
+    eq   = get_account_equity(client)
+    prev = get_ict_session_start_equity(client)
     return (eq - prev) / prev if prev > 0 else 0.0
 
 
-def _et_session_start_utc() -> datetime:
-    """
-    Start of the current ET trading day (00:00 ET) as a tz-aware UTC datetime.
-    Stateless anchor for 'today' — derived from the clock, not a local file, so it
-    is identical on every ephemeral runner. All ICT kill zones (London 3-5am ET,
-    NY 8:30-11am ET, etc.) fall after 00:00 ET, so a round-trip never straddles
-    this boundary.
-    """
-    et_now      = datetime.now(ICTModel.ET)
-    et_midnight = ICTModel.ET.localize(datetime.combine(et_now.date(), time(0, 0)))
-    return et_midnight.astimezone(timezone.utc)
-
-
-def _ict_realized_trades_today(client: TradingClient) -> list[float]:
-    """
-    Reconstruct today's CLOSED ICT round-trips straight from Alpaca order history.
-
-    SPY is ICT-exclusive on this account (Kronos trades NVDA/USO; MT5 is a separate
-    platform), so EVERY filled SPY order today belongs to ICT — the same isolation
-    status.py already relies on. We walk fills in fill-time order, accumulate signed
-    cash flow, and snapshot realized P&L each time the net position returns flat.
-
-    This is exit-path agnostic: it counts bracket SL/TP fills AND manual time-exit
-    `close_position` fills, and it needs ZERO local state — so it produces the same
-    answer on a fresh GitHub runner as on the Mac. Bracket child legs share their
-    parent's created_at, so we MUST order by filled_at (actual fill time), never
-    created_at, or an exit could sort before its entry.
-    """
-    orders = client.get_orders(filter=GetOrdersRequest(
-        status  = QueryOrderStatus.ALL,
-        after   = _et_session_start_utc(),
-        symbols = [SYMBOL],
-        limit   = 500,
-    ))
-    fills = [o for o in orders
-             if o.filled_at is not None
-             and o.filled_qty is not None and float(o.filled_qty) > 0
-             and o.filled_avg_price is not None]
-    fills.sort(key=lambda o: o.filled_at)
-
-    trades: list[float] = []
-    pos_qty = 0.0   # signed shares held within the currently-open round-trip
-    cash    = 0.0   # signed cash flow of that round-trip (+ received, - spent)
-    for o in fills:
-        qty    = float(o.filled_qty)
-        px     = float(o.filled_avg_price)
-        signed = qty if o.side == OrderSide.BUY else -qty
-        cash  -= signed * px          # buy spends cash (-), sell receives cash (+)
-        pos_qty += signed
-        if abs(pos_qty) < 1e-9:       # net flat → one round-trip complete
-            trades.append(cash)
-            cash = 0.0
-    return trades
-
-
-def count_daily_losses(client: TradingClient) -> int:
-    """
-    Number of LOSING ICT round-trips closed today, derived 100% from the broker.
-
-    Replaces the old session-file dollar estimate, which silently returned 0 on
-    ephemeral GitHub runners (the local baseline file never persisted) — quietly
-    disabling the 2-loss daily halt. No try/except here: if the broker query fails
-    the exception propagates so the caller HALTS rather than assuming zero losses.
-    """
-    return sum(1 for pnl in _ict_realized_trades_today(client) if pnl < 0)
+# count_daily_losses() replaced by count_ict_losses_today() — see TOOL 2 section above.
+# The old equity-arithmetic fallback is removed: it caused the "flickering" bug
+# where Kronos NVDA profits reset the ICT loss counter mid-day.
 
 
 def check_total_dd(client: TradingClient) -> float:
     """
     Drawdown % from the all-time equity peak (live equity vs 1-year history peak).
-
     Fail-CLOSED: a broker error propagates so the caller HALTS rather than assuming
-    zero drawdown. (Previously this swallowed the exception and returned 0.0, which
-    silently disabled the -8% total-DD circuit breaker whenever the history endpoint
-    hiccuped.) An empty history is the one benign case — a genuinely fresh account
-    has no peak above itself, so 0.0 is correct there.
+    zero drawdown. (Previously swallowed the error and returned 0.0, silently
+    disabling the -8% total-DD breaker whenever the history endpoint hiccuped.)
+    An empty history is the one benign case — a fresh account has no peak above
+    itself, so 0.0 is correct there.
     """
     hist    = client.get_portfolio_history(GetPortfolioHistoryRequest(period="1A"))
     eq_list = [e for e in hist.equity if e is not None and e > 0]
     current = get_account_equity(client)   # live, includes unrealized P&L
     if not eq_list:
         return 0.0
-    peak = max(eq_list + [current])        # peak is never below current
+    peak = max(eq_list + [current])        # peak never below current
     return (current - peak) / peak if peak > 0 else 0.0
 
 
 def check_trailing_dd(client: TradingClient) -> float:
     """
     Intraday trailing drawdown from the equity peak, read from the BROKER's own
-    portfolio history — no local peak_equity file (that silently read 0 on
-    ephemeral runners, disabling prop-firm trailing-DD protection entirely).
-
-    The5ers/FTMO track trailing DD on the whole ACCOUNT, so account-level equity
-    is the correct basis here (all-time peak-to-trough is separately covered by
-    check_total_dd at -8%). Returns a NEGATIVE fraction (-0.04 = 4% below peak).
-    No try/except: a failed query propagates so the caller decides explicitly.
+    portfolio history — no local peak_equity file (that read 0 on ephemeral hosts
+    and silently disabled prop-firm trailing-DD protection). The5ers/FTMO track
+    trailing DD on the whole ACCOUNT, so account-level equity is the right basis
+    (all-time peak is separately covered by check_total_dd at -8%). Returns a
+    NEGATIVE fraction (-0.04 = 4% below peak). No try/except — a failed query
+    propagates so the caller decides explicitly.
     """
     hist = client.get_portfolio_history(GetPortfolioHistoryRequest(
         period="1D", timeframe="5Min", extended_hours=True))
     eqs     = [float(e) for e in hist.equity if e is not None and float(e) > 0]
     current = get_account_equity(client)
-    peak    = max(eqs + [current]) if eqs else current   # peak is never below current
+    peak    = max(eqs + [current]) if eqs else current   # peak never below current
     return (current - peak) / peak if peak > 0 else 0.0
+
+
+def notify_bracket_exit(client: TradingClient, state: dict) -> None:
+    """
+    Called when a state file exists but the position is gone — meaning Alpaca's
+    bracket SL or TP leg filled autonomously while the script was not running.
+    Queries recent closed orders to identify exit type and price, then sends a
+    Telegram notification with the full trade result.
+    Wrapped in try/except — a notification failure must never block anything.
+    """
+    try:
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+
+        entry_px   = float(state.get("entry", 0))
+        direction  = state.get("signal", "?")
+        shares     = int(state.get("shares", 0))
+        sl         = float(state.get("sl", 0))
+        tp         = float(state.get("tp", 0))
+        setup      = state.get("setup", "?")
+        kz         = state.get("kill_zone", "?")
+        entry_eq   = float(state.get("entry_equity", 0))
+        current_eq = get_account_equity(client)
+
+        # Query last 10 closed SPY orders to find the exit fill
+        exit_px    = None
+        exit_label = "CLOSED"
+        try:
+            orders = client.get_orders(GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED,
+                symbols=[SYMBOL],
+                limit=10,
+            ))
+            # Exit leg: BUY bracket exits via a SELL; SELL bracket exits via a BUY
+            expected_exit_side = "sell" if direction == "BUY" else "buy"
+            for o in orders:
+                if not o.filled_avg_price or float(o.filled_qty or 0) == 0:
+                    continue
+                if o.side.value == expected_exit_side:
+                    exit_px = float(o.filled_avg_price)
+                    # Classify SL vs TP by which level the fill is closer to
+                    exit_label = "🎯 TP HIT" if abs(exit_px - tp) < abs(exit_px - sl) else "🛑 SL HIT"
+                    break
+        except Exception:
+            pass
+
+        # P&L: use exact fill prices if available, else fall back to equity delta
+        if exit_px and entry_px and shares:
+            pnl_dollars = (exit_px - entry_px) * shares if direction == "BUY" else (entry_px - exit_px) * shares
+            pnl_pct     = pnl_dollars / (entry_px * shares) * 100
+        elif entry_eq and current_eq:
+            pnl_dollars = current_eq - entry_eq
+            pnl_pct     = pnl_dollars / entry_eq * 100 if entry_eq else 0.0
+        else:
+            pnl_dollars = 0.0
+            pnl_pct     = 0.0
+
+        emoji    = "✅" if pnl_dollars >= 0 else "❌"
+        px_line  = f"Entry: ${entry_px:.2f} → Exit: ${exit_px:.2f}" if exit_px else f"Entry: ${entry_px:.2f} (exit price unavailable)"
+
+        msg = (
+            f"{emoji} <b>ICT {exit_label}</b>\n"
+            f"{direction} {shares}x {SYMBOL}\n"
+            f"{px_line}\n"
+            f"P&amp;L: <b>${pnl_dollars:+.2f} ({pnl_pct:+.2f}%)</b>\n"
+            f"Equity now: ${current_eq:,.2f}\n"
+            f"Setup: {setup} | Zone: {kz}"
+        )
+        send_telegram(msg)
+        log(f"[EXIT] {exit_label} | P&L: ${pnl_dollars:+.2f} ({pnl_pct:+.2f}%)")
+
+        # Record outcome to the append log + check circuit breaker
+        if pnl_dollars < 0:
+            total_losses = record_ict_loss(pnl_dollars, exit_label)
+            if check_circuit_breaker_magnitude(total_losses):
+                engage_day_lock(
+                    f"Loss #{total_losses} — magnitude confirmed system failure ({exit_label})",
+                    total_losses
+                )
+        else:
+            record_ict_win(pnl_dollars)   # feeds avg_win for CB magnitude calibration
+
+    except Exception as e:
+        log(f"[WARN] Exit notification failed: {e}")
 
 
 def calc_position_size(equity: float, entry: float, sl: float,
@@ -661,11 +1301,10 @@ def manage_open_position(client: TradingClient, pos: dict) -> None:
 
 def _is_duplicate_order(err: Exception) -> bool:
     """
-    True if the broker rejected an order because its client_order_id already exists
-    (an overlapping cron run already placed this bar's trade). Alpaca enforces
-    client_order_id uniqueness SERVER-SIDE and returns HTTP 422 — which is exactly
-    why the deterministic id is a real idempotency guard: a duplicate can never
-    become a second position. This only decides log-a-benign-skip vs. alert-failure.
+    True if Alpaca rejected an order because its client_order_id already exists —
+    i.e. an overlapping run already placed this bar's trade. Alpaca enforces
+    client_order_id uniqueness SERVER-SIDE (HTTP 422), so a duplicate can never
+    become a second position; this only decides benign-skip vs. failure alert.
     """
     if isinstance(err, APIError) and err.status_code == 422:
         return True
@@ -673,21 +1312,23 @@ def _is_duplicate_order(err: Exception) -> bool:
     return "client_order_id" in msg or ("unique" in msg and "order" in msg)
 
 
-def place_order(client: TradingClient, signal: dict, shares: int, bar_ts: str) -> None:
+def place_order(client: TradingClient, signal: dict, shares: int,
+                equity: float = 0.0, bar_ts: str = "") -> None:
     """
     Bracket order — SL and TP are sent directly to Alpaca.
     Alpaca auto-closes the position when either level is hit,
     even if our script is not running (cloud-safe).
 
-    Idempotency: client_order_id is derived from the signal BAR timestamp, so two
-    overlapping cron runs analysing the same 5-minute bar build the SAME id and
-    Alpaca rejects the second — no double entry.
+    Idempotent: client_order_id is derived from the signal BAR timestamp, so two
+    overlapping runs on the same 5-minute bar build the SAME id and Alpaca rejects
+    the duplicate — a hard, server-side complement to is_signal_valid().
     """
     side = OrderSide.BUY if signal["signal"] == "BUY" else OrderSide.SELL
     sl   = round(signal["sl"], 2)
     tp   = round(signal["tp"], 2)
 
-    order_id = f"{ICT_ORDER_PREFIX}_{SYMBOL}_{bar_ts}"
+    bar_token = "".join(ch for ch in bar_ts if ch.isalnum()) or datetime.now().strftime("%Y%m%d%H%M%S")
+    order_id  = f"{ICT_ORDER_PREFIX}_{SYMBOL}_{bar_token}"
     req = MarketOrderRequest(
         symbol           = SYMBOL,
         qty              = shares,
@@ -704,11 +1345,14 @@ def place_order(client: TradingClient, signal: dict, shares: int, bar_ts: str) -
     log(f"[ORDER] {signal['signal']} {shares}x {SYMBOL} | {signal['reason']}")
     log(f"        SL={sl} TP={tp} RR=1:{signal['rr']} id={order.id} cid={order_id}")
 
+    direction = "🟢 BUY" if signal["signal"] == "BUY" else "🔴 SELL"
     msg = (
-        f"<b>ICT {signal['signal']}</b> {SYMBOL}\n"
+        f"<b>{direction} {SYMBOL}</b>\n"
         f"Setup: {signal['setup']} | Zone: {signal['kill_zone']} | HTF: {signal['htf_bias']}\n"
-        f"Entry: <b>{signal['entry']:.2f}</b> | SL: {sl} | TP: {tp}\n"
-        f"Shares: {shares} | {signal['reason']}"
+        f"Entry: <b>${signal['entry']:.2f}</b> | SL: ${sl} | TP: ${tp}\n"
+        f"Shares: {shares} | RR: 1:{signal['rr']}\n"
+        f"Equity: <b>${equity:,.2f}</b>\n"
+        f"{signal['reason']}"
     )
     send_telegram(msg)
 
@@ -720,6 +1364,14 @@ def place_order(client: TradingClient, signal: dict, shares: int, bar_ts: str) -
 def main() -> None:
     log("═" * 60)
     log("ICT Alpaca Trader — starting")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TOOL 2 — PHYSICAL PADLOCK: must be the very first check, before anything.
+    # A dead process cannot revenge trade. sys.exit(0) cannot be bypassed by
+    # downstream logic, exception handlers, or accidental restarts.
+    # ══════════════════════════════════════════════════════════════════════════
+    if is_day_locked():
+        sys.exit(0)
 
     # Load Alpaca client
     key, secret = load_credentials()
@@ -743,19 +1395,27 @@ def main() -> None:
             send_telegram(f"⏰ ICT TIME EXIT: {_kz} session closed")
             return
 
+    # ── Guard 3: Orphan Reaper — sweep ghost orders before anything else ──────
+    orphan_reaper(client)
+
+    # ── Spread baseline — fetch NBBO once per tick, shared by all consumers ──
+    refresh_spread_baseline()
+
     # ── Risk checks — broker-derived; fail CLOSED if any cannot be computed ──
     # No silent zero-fills: if a metric can't be read, we do NOT open a trade.
+    # daily_losses is now the AUTHORITATIVE broker count (Alpaca order history);
+    # the local append-log count stays for the magnitude gate + audit trail.
     try:
         daily_dd     = check_daily_dd(client)
         total_dd     = check_total_dd(client)
         equity       = get_account_equity(client)
-        daily_losses = count_daily_losses(client)
+        daily_losses = count_ict_losses_today_broker(client)
     except Exception as e:
         log(f"[HALT] Risk metrics unavailable — standing down, no trade: {e}")
         send_telegram(f"⛔ ICT HALT: risk checks failed — {e}")
         return
 
-    log(f"Equity: ${equity:,.2f} | Daily DD: {daily_dd:.2%} | Total DD: {total_dd:.2%} | Losses today: {daily_losses}/{DAILY_LOSS_LIMIT}")
+    log(f"Equity: ${equity:,.2f} | Daily DD: {daily_dd:.2%} | Total DD: {total_dd:.2%} | ICT Losses today: {daily_losses}/{CIRCUIT_BREAKER_LOSSES}")
 
     if daily_dd <= DAILY_DD_LIMIT:
         log(f"[HALT] Daily DD {daily_dd:.2%} breaches limit {DAILY_DD_LIMIT:.0%}. No trade.")
@@ -767,10 +1427,13 @@ def main() -> None:
         send_telegram(f"⛔ ICT HALT: Total DD {total_dd:.2%}")
         return
 
-    if daily_losses >= DAILY_LOSS_LIMIT:
-        log(f"[HALT] {daily_losses} losses today — 2-loss daily rule. Done for the day.")
-        send_telegram(f"⛔ ICT HALT: {daily_losses} losses today — terminal closed")
-        return
+    if daily_losses >= CIRCUIT_BREAKER_LOSSES:
+        if check_circuit_breaker_magnitude(daily_losses):
+            log(f"[HALT] {daily_losses} losses + magnitude confirmed — circuit breaker engaging")
+            engage_day_lock(f"{daily_losses} ICT losses — magnitude gate confirmed", daily_losses)
+            sys.exit(0)
+        else:
+            log(f"[CB] {daily_losses} losses hit count limit but magnitude within noise threshold — continuing")
 
     if daily_dd >= DAILY_PROFIT_TARGET:
         log(f"[HALT] Daily profit target hit: +{daily_dd:.2%} ≥ +{DAILY_PROFIT_TARGET:.0%}. Banking gains.")
@@ -780,7 +1443,7 @@ def main() -> None:
     # Reduce risk if halfway to daily limit
     risk_pct = RISK_PER_TRADE_SMALL if daily_dd <= DAILY_DD_LIMIT / 2 else RISK_PER_TRADE
 
-    model = ICTModel(tf_minutes=5, fvg_min_pct=0.0002, rr_ratio=3.0, displacement_factor=1.5)
+    model = ICTModel(tf_minutes=5, fvg_min_pct=0.0002, rr_ratio=3.0, displacement_factor=1.5, strict_filters=False)
 
     # ── Existing position check ────────────────────────────────────────────
     pos   = get_ict_position(client)
@@ -789,8 +1452,7 @@ def main() -> None:
     if pos:
         # Trailing drawdown — broker-derived intraday peak (no local peak_equity).
         # Fail SAFE, not closed: if the metric can't be read we HOLD (the exchange
-        # bracket still protects the position) and alert loudly — we never
-        # force-close or fall silent on a transient API blip.
+        # bracket still protects) and alert loudly — never force-close on an API blip.
         try:
             trailing_dd = check_trailing_dd(client)
         except Exception as e:
@@ -809,8 +1471,28 @@ def main() -> None:
         manage_open_position(client, pos)
         return
 
+    # ── Bracket exit detection ─────────────────────────────────────────────
+    # pos is None here. If a state file exists the bracket SL/TP fired since
+    # the last run — Alpaca closed the position autonomously. Notify and reset.
+    if state is not None:
+        notify_bracket_exit(client, state)
+        clear_state()
+        return
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TOOL 1 — NEWS BLACKOUT CLOCK: gates before fetch_data() so no signal is
+    # ever evaluated during CPI/FOMC/open volatility windows. Existing positions
+    # are unaffected — the check only blocks new entry logic below.
+    # ══════════════════════════════════════════════════════════════════════════
+    if is_embargo_active():
+        log("[EMBARGO] High-impact news window active — signal evaluation suppressed")
+        return
+
     # ── Data feed + signal ─────────────────────────────────────────────────
     df_5m, df_1h, df_corr, data_source = fetch_data()
+    # Fetch ES=F 1H futures separately for HTF bias — anchors trend to the
+    # continuous overnight market, not SPY's RTH-only window.
+    df_1h_htf = fetch_htf_futures_1h()
 
     if data_source == "insufficient" or df_5m is None:
         log("[SKIP] No actionable data for this session window — standing by")
@@ -826,13 +1508,20 @@ def main() -> None:
     active_kz      = None   # determined after signal
     trend_bp_state = {}     # {kz: bool} — loaded per kill zone below
 
-    signal = model.get_signal(df_5m, df_1h, df_correlated=df_corr)
+    signal = model.get_signal(df_5m, df_1h, df_correlated=df_corr, df_1h_htf=df_1h_htf)
 
     # Persist trend day bypass if signal reason indicates it
     if signal.get("kill_zone"):
         active_kz = signal["kill_zone"]
         if "[TREND_DAY]" in signal.get("reason", "") or get_trend_day_bypass(active_kz):
             set_trend_day_bypass(active_kz)
+
+    # Freeze the original ICT model entry BEFORE any price translation.
+    # translate_signal_to_spy() overwrites signal["entry"] with a fresh live
+    # SPY price. If we later compare exec_px (also a fresh live price) against
+    # that overwritten value, we get live - live = 0 and the drift gate is blind.
+    # _model_entry preserves the original FVG/OB level for the honest comparison.
+    _model_entry = signal["entry"]
 
     # Translate ES1! price levels → SPY prices when TradingView data was used
     if data_source == "tradingview" and signal["signal"] != "HOLD":
@@ -844,30 +1533,56 @@ def main() -> None:
         log("No ICT setup — standing by")
         return
 
-    # ── Entry drift gate — skip if price moved too far from FVG entry ────────
-    current_px = float(df_5m["close"].iloc[-1])
-    if data_source == "tradingview":   # drift only meaningful when translate_signal_to_spy used live price
-        entry_drift = abs(current_px - signal["entry"]) / signal["entry"]
-        if entry_drift > MAX_ENTRY_DRIFT:
-            log(f"[SKIP] Entry drift {entry_drift:.3%} > {MAX_ENTRY_DRIFT:.3%} — price moved from FVG zone")
-            return
+    # ── Guard 1+2: Bouncer + Decoy Detector ──────────────────────────────────
+    # bar_ts = timestamp of the last 5m bar — the cron-native equivalent of
+    # bar_index from a webhook payload. Rejects stale or duplicate signals.
+    bar_ts = str(df_5m.index[-1])
+    if not is_signal_valid(signal["signal"], SYMBOL, bar_ts):
+        return
 
-    # ── Position sizing ─────────────────────────────────────────────────────
+    # ── Live price fetch — used for both drift gate and position sizing ───────
+    # The 5m close is 1–4 min stale at execution time; during NY open that
+    # translates to $0.30–$0.80 of untracked slippage baked into every size calc.
+    live_px = fetch_live_price(client)
+    exec_px = live_px if live_px is not None else float(df_5m["close"].iloc[-1])
+
+    # ── Entry drift gate — active on ALL data sources ─────────────────────────
+    # Previously gated behind `data_source == "tradingview"`, which made it
+    # completely dead code on the VPS where data_source is always "alpaca".
+    entry_drift = abs(exec_px - _model_entry) / _model_entry
+    if entry_drift > MAX_ENTRY_DRIFT:
+        log(f"[WARN] Trade skipped: Entry drift exceeded ({entry_drift:.3%} > {MAX_ENTRY_DRIFT:.3%}) — price has moved from FVG zone")
+        return
+
+    # Stamp live execution price onto the signal so the state file and Telegram
+    # notification reflect the actual fill price, not the stale bar close.
+    signal = {**signal, "entry": round(exec_px, 2)}
+
+    # ── Position sizing — live entry vs structural SL for exact risk ──────────
+    # signal["sl"] is the ICT structural level (unchanged by live price).
+    # Risk distance = live fill price → SL, not historical bar close → SL.
     shares = calc_position_size(equity, signal["entry"], signal["sl"], risk_pct)
     if shares == 0:
         log("[WARN] Calculated 0 shares — skip")
         return
 
     cost = shares * signal["entry"]
-    log(f"Position size: {shares} shares @ ${signal['entry']:.2f} = ${cost:,.2f}")
+    log(f"Live entry: ${signal['entry']:.2f} (drift: {entry_drift:.3%}) | {shares} shares = ${cost:,.2f}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TOOL 3 — SPREAD SMOKE DETECTOR: live NBBO check at the exact submission
+    # instant. Aborts if bid-ask spread > 5bp — the market's own warning light
+    # for news spikes and flash-crash conditions before price even gaps.
+    # ══════════════════════════════════════════════════════════════════════════
+    if not check_spread_gate(client, SYMBOL):
+        log("[SMOKE DETECTOR] Entry aborted — abnormal spread detected")
+        return
 
     # ── Place bracket order ─────────────────────────────────────────────────
-    # Deterministic id per 5-minute bar → two overlapping cron runs on the same
-    # bar build the SAME client_order_id, and Alpaca rejects the duplicate.
-    bar_ts = df_5m.index[-1].strftime("%Y%m%d%H%M")
-    save_state(signal, shares, data_source)   # save BEFORE submit — prevent orphan on crash
+    # bar_ts (computed above for is_signal_valid) → deterministic client_order_id.
+    save_state(signal, shares, equity, data_source)   # save BEFORE submit — prevent orphan on crash
     try:
-        place_order(client, signal, shares, bar_ts)
+        place_order(client, signal, shares, equity, bar_ts)
     except Exception as e:
         if _is_duplicate_order(e):
             # Concurrent run already placed this bar's trade — keep state, no alert.
