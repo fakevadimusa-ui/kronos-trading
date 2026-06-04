@@ -53,8 +53,10 @@ from alpaca.trading.requests import (
     TakeProfitRequest,
     StopLossRequest,
     GetPortfolioHistoryRequest,
+    GetOrdersRequest,
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, QueryOrderStatus
+from alpaca.common.exceptions import APIError
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -340,8 +342,15 @@ def translate_signal_to_spy(signal: dict, client) -> dict:
     return translated
 
 
-def save_state(signal: dict, shares: int, equity: float, data_source: str) -> None:
-    """Persist SL/TP + metadata so subsequent runs can manage the position."""
+def save_state(signal: dict, shares: int, data_source: str) -> None:
+    """
+    Persist position-management metadata (time-exit / stagnation / feed-freeze).
+
+    NOTE: this file is NOT used for risk management any more — daily losses and
+    trailing DD are now broker-derived (see count_daily_losses / check_trailing_dd).
+    It is still local-file based for position management, which remains ephemeral
+    on GitHub Actions (flagged for migration in the next cycle).
+    """
     state = {
         "symbol":       SYMBOL,
         "signal":       signal["signal"],
@@ -353,7 +362,6 @@ def save_state(signal: dict, shares: int, equity: float, data_source: str) -> No
         "kill_zone":    signal["kill_zone"],
         "opened_at":    datetime.now().isoformat(),
         "data_source":  data_source,      # feed active when trade was opened
-        "peak_equity":  equity,           # tracks intraday high for trailing DD
     }
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(STATE_PATH, "w") as f:
@@ -395,21 +403,6 @@ def _save_session(s: dict) -> None:
         json.dump(s, f, indent=2)
 
 
-def get_ict_session_start_equity(client: TradingClient) -> float:
-    """
-    Return today's ICT-isolated starting equity.
-    First call of the day records current equity as baseline so Kronos
-    losses from other sessions don't contaminate ICT's daily loss count.
-    """
-    s = _load_session()
-    if "ict_start_equity" in s:
-        return float(s["ict_start_equity"])
-    eq = get_account_equity(client)
-    s["ict_start_equity"] = eq
-    _save_session(s)
-    return eq
-
-
 def get_trend_day_bypass(kill_zone: str) -> bool:
     """Return True if trend day bypass was already triggered this session."""
     return bool(_load_session().get(f"trend_bypass_{kill_zone}", False))
@@ -439,65 +432,109 @@ def check_daily_dd(client: TradingClient) -> float:
     return (eq - prev) / prev if prev > 0 else 0.0
 
 
+def _et_session_start_utc() -> datetime:
+    """
+    Start of the current ET trading day (00:00 ET) as a tz-aware UTC datetime.
+    Stateless anchor for 'today' — derived from the clock, not a local file, so it
+    is identical on every ephemeral runner. All ICT kill zones (London 3-5am ET,
+    NY 8:30-11am ET, etc.) fall after 00:00 ET, so a round-trip never straddles
+    this boundary.
+    """
+    et_now      = datetime.now(ICTModel.ET)
+    et_midnight = ICTModel.ET.localize(datetime.combine(et_now.date(), time(0, 0)))
+    return et_midnight.astimezone(timezone.utc)
+
+
+def _ict_realized_trades_today(client: TradingClient) -> list[float]:
+    """
+    Reconstruct today's CLOSED ICT round-trips straight from Alpaca order history.
+
+    SPY is ICT-exclusive on this account (Kronos trades NVDA/USO; MT5 is a separate
+    platform), so EVERY filled SPY order today belongs to ICT — the same isolation
+    status.py already relies on. We walk fills in fill-time order, accumulate signed
+    cash flow, and snapshot realized P&L each time the net position returns flat.
+
+    This is exit-path agnostic: it counts bracket SL/TP fills AND manual time-exit
+    `close_position` fills, and it needs ZERO local state — so it produces the same
+    answer on a fresh GitHub runner as on the Mac. Bracket child legs share their
+    parent's created_at, so we MUST order by filled_at (actual fill time), never
+    created_at, or an exit could sort before its entry.
+    """
+    orders = client.get_orders(filter=GetOrdersRequest(
+        status  = QueryOrderStatus.ALL,
+        after   = _et_session_start_utc(),
+        symbols = [SYMBOL],
+        limit   = 500,
+    ))
+    fills = [o for o in orders
+             if o.filled_at is not None
+             and o.filled_qty is not None and float(o.filled_qty) > 0
+             and o.filled_avg_price is not None]
+    fills.sort(key=lambda o: o.filled_at)
+
+    trades: list[float] = []
+    pos_qty = 0.0   # signed shares held within the currently-open round-trip
+    cash    = 0.0   # signed cash flow of that round-trip (+ received, - spent)
+    for o in fills:
+        qty    = float(o.filled_qty)
+        px     = float(o.filled_avg_price)
+        signed = qty if o.side == OrderSide.BUY else -qty
+        cash  -= signed * px          # buy spends cash (-), sell receives cash (+)
+        pos_qty += signed
+        if abs(pos_qty) < 1e-9:       # net flat → one round-trip complete
+            trades.append(cash)
+            cash = 0.0
+    return trades
+
+
 def count_daily_losses(client: TradingClient) -> int:
     """
-    Estimate ICT-isolated daily loss count.
-    Uses ICT session start equity (not previous day close) so Kronos NVDA
-    losses don't consume ICT's daily trade budget.
+    Number of LOSING ICT round-trips closed today, derived 100% from the broker.
+
+    Replaces the old session-file dollar estimate, which silently returned 0 on
+    ephemeral GitHub runners (the local baseline file never persisted) — quietly
+    disabling the 2-loss daily halt. No try/except here: if the broker query fails
+    the exception propagates so the caller HALTS rather than assuming zero losses.
     """
-    try:
-        start_eq       = get_ict_session_start_equity(client)
-        current_eq     = get_account_equity(client)
-        daily_pnl      = current_eq - start_eq
-        if daily_pnl >= 0:
-            return 0
-        loss_per_trade = max(start_eq * RISK_PER_TRADE, 1.0)
-        return min(DAILY_LOSS_LIMIT + 1, int(abs(daily_pnl) / loss_per_trade))
-    except Exception as e:
-        log(f"[WARN] Could not count daily losses: {e}")
-        return 0
+    return sum(1 for pnl in _ict_realized_trades_today(client) if pnl < 0)
 
 
 def check_total_dd(client: TradingClient) -> float:
     """
-    Returns drawdown % from all-time equity peak.
-    Uses live equity (includes intraday unrealized P&L) vs history snapshots for peak.
-    """
-    try:
-        hist    = client.get_portfolio_history(GetPortfolioHistoryRequest(period="1A"))
-        eq_list = [e for e in hist.equity if e is not None and e > 0]
-        if not eq_list:
-            return 0.0
-        peak    = max(eq_list)
-        current = get_account_equity(client)   # live, includes unrealized P&L
-        return (current - peak) / peak if peak > 0 else 0.0
-    except Exception as e:
-        log(f"[WARN] Could not fetch portfolio history: {e}")
-        return 0.0
+    Drawdown % from the all-time equity peak (live equity vs 1-year history peak).
 
-
-def check_trailing_dd(client: TradingClient, state: dict | None) -> float:
+    Fail-CLOSED: a broker error propagates so the caller HALTS rather than assuming
+    zero drawdown. (Previously this swallowed the exception and returned 0.0, which
+    silently disabled the -8% total-DD circuit breaker whenever the history endpoint
+    hiccuped.) An empty history is the one benign case — a genuinely fresh account
+    has no peak above itself, so 0.0 is correct there.
     """
-    Prop firms (The5ers/FTMO) track trailing drawdown from intraday equity peak.
-    Returns drawdown % from the highest equity seen since the position opened.
-    """
-    if not state or "peak_equity" not in state:
+    hist    = client.get_portfolio_history(GetPortfolioHistoryRequest(period="1A"))
+    eq_list = [e for e in hist.equity if e is not None and e > 0]
+    current = get_account_equity(client)   # live, includes unrealized P&L
+    if not eq_list:
         return 0.0
-    current    = get_account_equity(client)
-    peak       = state["peak_equity"]
+    peak = max(eq_list + [current])        # peak is never below current
     return (current - peak) / peak if peak > 0 else 0.0
 
 
-def update_peak_equity(client: TradingClient, state: dict) -> None:
-    """Update peak_equity in state file if current equity is higher."""
-    try:
-        current = get_account_equity(client)
-        if current > state.get("peak_equity", 0):
-            state["peak_equity"] = current
-            with open(STATE_PATH, "w") as f:
-                json.dump(state, f, indent=2)
-    except Exception:
-        pass
+def check_trailing_dd(client: TradingClient) -> float:
+    """
+    Intraday trailing drawdown from the equity peak, read from the BROKER's own
+    portfolio history — no local peak_equity file (that silently read 0 on
+    ephemeral runners, disabling prop-firm trailing-DD protection entirely).
+
+    The5ers/FTMO track trailing DD on the whole ACCOUNT, so account-level equity
+    is the correct basis here (all-time peak-to-trough is separately covered by
+    check_total_dd at -8%). Returns a NEGATIVE fraction (-0.04 = 4% below peak).
+    No try/except: a failed query propagates so the caller decides explicitly.
+    """
+    hist = client.get_portfolio_history(GetPortfolioHistoryRequest(
+        period="1D", timeframe="5Min", extended_hours=True))
+    eqs     = [float(e) for e in hist.equity if e is not None and float(e) > 0]
+    current = get_account_equity(client)
+    peak    = max(eqs + [current]) if eqs else current   # peak is never below current
+    return (current - peak) / peak if peak > 0 else 0.0
 
 
 def calc_position_size(equity: float, entry: float, sl: float,
@@ -622,17 +659,35 @@ def manage_open_position(client: TradingClient, pos: dict) -> None:
 # ORDER EXECUTION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def place_order(client: TradingClient, signal: dict, shares: int) -> None:
+def _is_duplicate_order(err: Exception) -> bool:
+    """
+    True if the broker rejected an order because its client_order_id already exists
+    (an overlapping cron run already placed this bar's trade). Alpaca enforces
+    client_order_id uniqueness SERVER-SIDE and returns HTTP 422 — which is exactly
+    why the deterministic id is a real idempotency guard: a duplicate can never
+    become a second position. This only decides log-a-benign-skip vs. alert-failure.
+    """
+    if isinstance(err, APIError) and err.status_code == 422:
+        return True
+    msg = str(err).lower()
+    return "client_order_id" in msg or ("unique" in msg and "order" in msg)
+
+
+def place_order(client: TradingClient, signal: dict, shares: int, bar_ts: str) -> None:
     """
     Bracket order — SL and TP are sent directly to Alpaca.
     Alpaca auto-closes the position when either level is hit,
     even if our script is not running (cloud-safe).
+
+    Idempotency: client_order_id is derived from the signal BAR timestamp, so two
+    overlapping cron runs analysing the same 5-minute bar build the SAME id and
+    Alpaca rejects the second — no double entry.
     """
     side = OrderSide.BUY if signal["signal"] == "BUY" else OrderSide.SELL
     sl   = round(signal["sl"], 2)
     tp   = round(signal["tp"], 2)
 
-    order_id = f"{ICT_ORDER_PREFIX}_{SYMBOL}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    order_id = f"{ICT_ORDER_PREFIX}_{SYMBOL}_{bar_ts}"
     req = MarketOrderRequest(
         symbol           = SYMBOL,
         qty              = shares,
@@ -647,7 +702,7 @@ def place_order(client: TradingClient, signal: dict, shares: int) -> None:
     if order.status.value not in ("new", "pending_new", "accepted", "filled"):
         raise RuntimeError(f"Order rejected by Alpaca: status={order.status.value} id={order.id}")
     log(f"[ORDER] {signal['signal']} {shares}x {SYMBOL} | {signal['reason']}")
-    log(f"        SL={sl} TP={tp} RR=1:{signal['rr']} id={order.id}")
+    log(f"        SL={sl} TP={tp} RR=1:{signal['rr']} id={order.id} cid={order_id}")
 
     msg = (
         f"<b>ICT {signal['signal']}</b> {SYMBOL}\n"
@@ -688,12 +743,18 @@ def main() -> None:
             send_telegram(f"⏰ ICT TIME EXIT: {_kz} session closed")
             return
 
-    # ── Risk checks ────────────────────────────────────────────────────────
-    daily_dd = check_daily_dd(client)
-    total_dd = check_total_dd(client)
-    equity   = get_account_equity(client)
+    # ── Risk checks — broker-derived; fail CLOSED if any cannot be computed ──
+    # No silent zero-fills: if a metric can't be read, we do NOT open a trade.
+    try:
+        daily_dd     = check_daily_dd(client)
+        total_dd     = check_total_dd(client)
+        equity       = get_account_equity(client)
+        daily_losses = count_daily_losses(client)
+    except Exception as e:
+        log(f"[HALT] Risk metrics unavailable — standing down, no trade: {e}")
+        send_telegram(f"⛔ ICT HALT: risk checks failed — {e}")
+        return
 
-    daily_losses = count_daily_losses(client)
     log(f"Equity: ${equity:,.2f} | Daily DD: {daily_dd:.2%} | Total DD: {total_dd:.2%} | Losses today: {daily_losses}/{DAILY_LOSS_LIMIT}")
 
     if daily_dd <= DAILY_DD_LIMIT:
@@ -726,18 +787,23 @@ def main() -> None:
     state = load_state()
 
     if pos:
-        # Update intraday equity peak for trailing DD tracking
-        if state:
-            update_peak_equity(client, state)
-
-        # Trailing drawdown check (prop firm uses peak-to-trough, not daily open)
-        trailing_dd = check_trailing_dd(client, state)
-        if trailing_dd <= -TRAILING_DD_LIMIT:
-            log(f"[HALT] Trailing DD {trailing_dd:.2%} from intraday peak — prop firm protection")
-            send_telegram(f"⛔ ICT TRAILING DD: {trailing_dd:.2%} from peak — closing position")
-            close_ict_position(client)
-            clear_state()
-            return
+        # Trailing drawdown — broker-derived intraday peak (no local peak_equity).
+        # Fail SAFE, not closed: if the metric can't be read we HOLD (the exchange
+        # bracket still protects the position) and alert loudly — we never
+        # force-close or fall silent on a transient API blip.
+        try:
+            trailing_dd = check_trailing_dd(client)
+        except Exception as e:
+            log(f"[WARN] Trailing-DD unavailable — holding position, bracket intact: {e}")
+            send_telegram(f"⚠️ ICT: trailing-DD check failed ({e}) — position held")
+            trailing_dd = 0.0
+        else:
+            if trailing_dd <= -TRAILING_DD_LIMIT:
+                log(f"[HALT] Trailing DD {trailing_dd:.2%} from intraday peak — prop firm protection")
+                send_telegram(f"⛔ ICT TRAILING DD: {trailing_dd:.2%} from peak — closing position")
+                close_ict_position(client)
+                clear_state()
+                return
 
         log(f"[POS] Existing ICT position: {pos['side']} {pos['qty']} {SYMBOL} | Trailing DD: {trailing_dd:.2%}")
         manage_open_position(client, pos)
@@ -796,10 +862,17 @@ def main() -> None:
     log(f"Position size: {shares} shares @ ${signal['entry']:.2f} = ${cost:,.2f}")
 
     # ── Place bracket order ─────────────────────────────────────────────────
-    save_state(signal, shares, equity, data_source)   # save BEFORE submit — prevent orphan on crash
+    # Deterministic id per 5-minute bar → two overlapping cron runs on the same
+    # bar build the SAME client_order_id, and Alpaca rejects the duplicate.
+    bar_ts = df_5m.index[-1].strftime("%Y%m%d%H%M")
+    save_state(signal, shares, data_source)   # save BEFORE submit — prevent orphan on crash
     try:
-        place_order(client, signal, shares)
+        place_order(client, signal, shares, bar_ts)
     except Exception as e:
+        if _is_duplicate_order(e):
+            # Concurrent run already placed this bar's trade — keep state, no alert.
+            log(f"[IDEMPOTENT] Bar {bar_ts} already traded by a concurrent run — no double entry")
+            return
         log(f"[ERROR] Order failed — clearing state: {e}")
         clear_state()
         send_telegram(f"❌ ICT ORDER FAILED: {e}")

@@ -19,10 +19,18 @@ on:
     - cron: '0 15 * * 1-5'
   workflow_dispatch:   # manual trigger for testing
 
+# Serialize runs: never let two ICT runs overlap (would risk a double entry).
+# cancel-in-progress: false = a newer run QUEUES behind the active one instead of
+# cancelling it mid-order / mid-position-management.
+concurrency:
+  group: ict-trader
+  cancel-in-progress: false
+
 jobs:
   ict:
     name: ICT Signal + Execute
     runs-on: ubuntu-latest
+    timeout-minutes: 8   # a hung run must not block the serialized queue for hours
 
     steps:
       - name: Checkout repo
@@ -48,5 +56,6 @@ jobs:
           ALPACA_SECRET:   ${{ secrets.ALPACA_SECRET }}
           TELEGRAM_TOKEN:  ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        # No continue-on-error: a genuine crash should fail the run (visible red X).
+        # Clean risk-halts return exit 0 and stay green; only uncaught exceptions go red.
         run: python ict_alpaca_trader.py
-        continue-on-error: true
