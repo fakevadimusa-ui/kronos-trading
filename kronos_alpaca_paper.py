@@ -190,9 +190,17 @@ def check_and_trigger_circuit_breaker(client: TradingClient, equity: float) -> b
         return False
 
 
+_TOKENIZER_CFG = dict(
+    d_in=6, d_model=256, n_heads=4, ff_dim=512,
+    n_enc_layers=4, n_dec_layers=4,
+    ffn_dropout_p=0.0, attn_dropout_p=0.0, resid_dropout_p=0.0,
+    s1_bits=10, s2_bits=10,
+    beta=0.05, gamma0=1.0, gamma=1.1, zeta=0.05, group_size=4,
+)
+
 def load_kronos() -> KronosPredictor:
     log("Loading Kronos model...")
-    tokenizer = KronosTokenizer.from_pretrained(KRONOS_TOKENIZER_ID)
+    tokenizer = KronosTokenizer.from_pretrained(KRONOS_TOKENIZER_ID, **_TOKENIZER_CFG)
     model     = Kronos.from_pretrained(KRONOS_MODEL_ID)
     predictor = KronosPredictor(model, tokenizer, max_context=KRONOS_MAX_CONTEXT)
     log(f"Kronos loaded on {predictor.device}")

@@ -28,8 +28,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: hf-kronos-${{ hashFiles('requirements.txt') }}
-          restore-keys: hf-kronos-
+          key: hf-kronos-v2-${{ hashFiles('requirements.txt') }}
+          restore-keys: hf-kronos-v2-
 
       - name: Install PyTorch (CPU)
         run: pip install torch --index-url https://download.pytorch.org/whl/cpu
