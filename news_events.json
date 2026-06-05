@@ -1,0 +1,12 @@
+[
+  {"date": "2026-06-05", "event": "NFP",  "hour": 8,  "minute": 30},
+  {"date": "2026-07-03", "event": "NFP",  "hour": 8,  "minute": 30},
+  {"date": "2026-08-07", "event": "NFP",  "hour": 8,  "minute": 30},
+  {"date": "2026-09-04", "event": "NFP",  "hour": 8,  "minute": 30},
+  {"date": "2026-10-02", "event": "NFP",  "hour": 8,  "minute": 30},
+  {"date": "2026-11-06", "event": "NFP",  "hour": 8,  "minute": 30},
+  {"date": "2026-12-04", "event": "NFP",  "hour": 8,  "minute": 30},
+  {"date": "2027-01-08", "event": "NFP",  "hour": 8,  "minute": 30},
+  {"date": "2027-02-05", "event": "NFP",  "hour": 8,  "minute": 30},
+  {"date": "2027-03-05", "event": "NFP",  "hour": 8,  "minute": 30}
+]
