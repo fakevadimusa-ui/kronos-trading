@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+import fcntl
 import json
 import os
 import socket
@@ -92,6 +93,8 @@ TOTAL_DD_LIMIT       = -0.08
 DAILY_LOSS_LIMIT     = 2       # halt after 2 losses in one day
 DAILY_PROFIT_TARGET  = 0.015   # bank gains and stop at +1.5% for the day
 TRAILING_DD_LIMIT    = 0.04    # prop firm trailing drawdown from intraday peak
+MAX_POSITION_LEVERAGE = 1.0    # C5: cap position notional at 1x equity — a tight
+                               # structural stop must never size an oversized position
 
 CORR_SYMBOL     = "QQQ"    # NQ proxy for SMT divergence
 ICT_ORDER_PREFIX = "ICT"   # client_order_id prefix — isolates ICT from Kronos orders
@@ -293,10 +296,17 @@ def record_ict_win(pnl_dollars: float) -> None:
 
 def get_avg_ict_win(lookback_days: int = 10) -> float:
     """
-    Returns the average ICT winning trade size over the last lookback_days.
-    Falls back to a conservative $50 estimate if no win history exists.
-    Used to calibrate the magnitude threshold in the circuit breaker.
+    Average ICT winning-trade size over the last `lookback_days`, used to calibrate
+    the circuit-breaker magnitude gate. BROKER-FIRST: reconstructs wins from Alpaca
+    order history; falls back to the local win-log only if the broker read fails.
+    Defaults to a conservative $50 when there's no win history.
     """
+    try:
+        since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+        wins  = [p for p in _ict_realized_trades(_get_client(), since) if p > 0]
+        return (sum(wins) / len(wins)) if wins else 50.0   # broker is authoritative
+    except Exception as e:
+        log(f"[CB] avg-win broker read failed ({e}) — falling back to win-log")
     try:
         if not ICT_LOSS_LOG_PATH.exists():
             return 50.0
@@ -338,26 +348,31 @@ def check_circuit_breaker_magnitude(daily_losses: int) -> bool:
     if daily_losses < CIRCUIT_BREAKER_LOSSES:
         return False
 
-    # Read recent losses from append log
-    today = datetime.now().date().isoformat()
+    # Recent loss magnitudes — BROKER-FIRST (today's realized losing round-trips);
+    # fall back to the local append-log only if the broker read fails.
     recent_loss_pnls = []
     try:
-        if ICT_LOSS_LOG_PATH.exists():
-            with open(ICT_LOSS_LOG_PATH) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                        if (entry.get("date") == today
-                                and entry.get("pnl", 0) < 0
-                                and entry.get("type") != "win"):
-                            recent_loss_pnls.append(abs(float(entry["pnl"])))
-                    except json.JSONDecodeError:
-                        continue
-    except Exception:
-        pass
+        recent_loss_pnls = [abs(p) for p in _ict_realized_trades_today(_get_client()) if p < 0]
+    except Exception as e:
+        log(f"[CB] magnitude broker read failed ({e}) — falling back to loss-log")
+        today = datetime.now().date().isoformat()
+        try:
+            if ICT_LOSS_LOG_PATH.exists():
+                with open(ICT_LOSS_LOG_PATH) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                            if (entry.get("date") == today
+                                    and entry.get("pnl", 0) < 0
+                                    and entry.get("type") != "win"):
+                                recent_loss_pnls.append(abs(float(entry["pnl"])))
+                        except json.JSONDecodeError:
+                            continue
+        except Exception:
+            pass
 
     if not recent_loss_pnls:
         # No loss records yet — fall back to count-only
@@ -420,18 +435,25 @@ def _et_session_start_utc() -> datetime:
     return et_midnight.astimezone(timezone.utc)
 
 
-def _ict_realized_trades_today(client: TradingClient) -> list[float]:
+def _get_client() -> TradingClient:
+    """Build a TradingClient from env/JSON creds — for broker-derived risk reads in
+    functions (get_avg_ict_win, the magnitude gate) that don't already hold one."""
+    key, secret = load_credentials()
+    return TradingClient(key, secret, paper=os.environ.get("ALPACA_PAPER", "true").lower() == "true")
+
+
+def _ict_realized_trades(client: TradingClient, since: datetime) -> list[float]:
     """
-    Reconstruct today's CLOSED ICT round-trips from Alpaca order history.
+    Reconstruct CLOSED ICT round-trips since `since`, from Alpaca order history.
     SPY is ICT-exclusive on this account (Kronos=NVDA/USO), so every filled SPY
-    order today is ICT. Walk fills in fill-time order — bracket legs share their
-    parent's created_at, so we MUST sort by filled_at, never created_at — accumulate
-    signed cash, and snapshot realized P&L each time net position returns flat.
-    Exit-path agnostic: counts bracket SL/TP fills AND manual time-exit closes.
+    order is ICT. Walk fills in fill-time order — bracket legs share their parent's
+    created_at, so we MUST sort by filled_at, never created_at — accumulate signed
+    cash, and snapshot realized P&L each time net position returns flat. Exit-path
+    agnostic: counts bracket SL/TP fills AND manual time-exit closes.
     """
     orders = client.get_orders(filter=GetOrdersRequest(
         status  = QueryOrderStatus.ALL,
-        after   = _et_session_start_utc(),
+        after   = since,
         symbols = [SYMBOL],
         limit   = 500,
     ))
@@ -454,6 +476,11 @@ def _ict_realized_trades_today(client: TradingClient) -> list[float]:
             trades.append(cash)
             cash = 0.0
     return trades
+
+
+def _ict_realized_trades_today(client: TradingClient) -> list[float]:
+    """Today's CLOSED ICT round-trips (ET trading day)."""
+    return _ict_realized_trades(client, _et_session_start_utc())
 
 
 def count_ict_losses_today_broker(client: TradingClient) -> int:
@@ -1179,12 +1206,26 @@ def notify_bracket_exit(client: TradingClient, state: dict) -> None:
 
 def calc_position_size(equity: float, entry: float, sl: float,
                        risk_pct: float = RISK_PER_TRADE) -> int:
-    """Shares to buy/sell for given risk %."""
-    risk_dollars = equity * risk_pct
+    """
+    Shares to buy/sell for the given risk %, with a HARD notional ceiling.
+
+    C5 guard: ICT order-block stops can be ultra-tight (0.03-0.07%). At a fixed
+    risk %, a tight stop demands a huge share count — e.g. a 0.05% stop at 0.5%
+    risk ≈ 10x notional. We cap the position at MAX_POSITION_LEVERAGE × equity, so
+    a tight stop quietly UNDER-risks instead of blowing past buying power.
+    """
     risk_per_share = abs(entry - sl)
-    if risk_per_share <= 0:
+    if risk_per_share <= 0 or entry <= 0:
         return 0
-    return max(1, int(risk_dollars / risk_per_share))
+    shares     = max(1, int((equity * risk_pct) / risk_per_share))
+    max_shares = int((equity * MAX_POSITION_LEVERAGE) / entry)
+    if max_shares < 1:
+        return 0
+    if shares > max_shares:
+        log(f"[SIZE CAP] {shares}→{max_shares} shares — stop {risk_per_share / entry:.3%} too tight "
+            f"for {risk_pct:.2%} risk; capping notional at {MAX_POSITION_LEVERAGE:.0f}x equity")
+        shares = max_shares
+    return shares
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1361,9 +1402,35 @@ def place_order(client: TradingClient, signal: dict, shares: int,
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Single-run lock — prevents two cron invocations from trading the same window.
+_RUN_LOCK_PATH = Path.home() / "freqtrade/user_data/logs/ict_run.lock"
+_RUN_LOCK_FH = None   # module-level ref so the lock is held for the whole process
+
+def acquire_run_lock() -> bool:
+    """True if we got the exclusive lock; False if another ICT run holds it.
+    Fail-OPEN on infrastructure error — a lock glitch must not halt trading
+    (the deterministic client_order_id still blocks any double entry)."""
+    global _RUN_LOCK_FH
+    try:
+        _RUN_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _RUN_LOCK_FH = open(_RUN_LOCK_PATH, "w")
+        fcntl.flock(_RUN_LOCK_FH, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+    except Exception as e:
+        log(f"[LOCK] lock unavailable ({e}) — proceeding (order-id still guards double entry)")
+        return True
+
+
 def main() -> None:
     log("═" * 60)
     log("ICT Alpaca Trader — starting")
+
+    # ── Single-run lock — overlapping cron runs must not double-work ──────────
+    if not acquire_run_lock():
+        log("[LOCK] Another ICT run is already in progress — exiting to avoid overlap")
+        return
 
     # ══════════════════════════════════════════════════════════════════════════
     # TOOL 2 — PHYSICAL PADLOCK: must be the very first check, before anything.
@@ -1497,6 +1564,21 @@ def main() -> None:
     if data_source == "insufficient" or df_5m is None:
         log("[SKIP] No actionable data for this session window — standing by")
         return
+
+    # ── C4: drop the still-forming last 5m bar so PATTERN DETECTION runs on
+    # CLOSED bars only (no repainting). Execution stays current — fetch_live_price()
+    # below provides the live entry; only the FVG/OB scan is shifted to closed bars.
+    try:
+        last_ts = df_5m.index[-1]
+        if getattr(last_ts, "tzinfo", None) is None:
+            last_ts = last_ts.tz_localize("UTC")
+        if len(df_5m) > 2 and pd.Timestamp.now(tz="UTC") < last_ts + pd.Timedelta(minutes=5):
+            df_5m = df_5m.iloc[:-1]
+            if df_corr is not None and len(df_corr) > 2:
+                df_corr = df_corr.iloc[:-1]
+            log(f"[C4] Dropped forming bar — analysing {len(df_5m)} closed 5m bars")
+    except Exception as e:
+        log(f"[C4] forming-bar check skipped: {e}")
 
     # Data feed freeze: if source changed mid-session, don't open new positions
     if state and state.get("data_source") and state["data_source"] != data_source:
