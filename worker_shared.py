@@ -328,19 +328,11 @@ class WorkerGuards:
     # ── [D] Broker-first loss count ────────────────────────────────────────────
 
     def _et_session_start_utc(self) -> datetime:
+        """Start of current ET trading day (00:00 ET) as tz-aware UTC."""
         et_now      = datetime.now(ET)
-        et_midnight = ET.fromutc(
-            datetime.combine(et_now.date(), time(0, 0)).replace(tzinfo=ET)
-            .astimezone(timezone.utc).replace(tzinfo=None).replace(tzinfo=timezone.utc)
-        )
-        # Simpler: just subtract hours to midnight ET
-        now_utc = datetime.now(timezone.utc)
-        et_now2 = now_utc.astimezone(ET)
-        midnight_et = ET.fromutc(
-            datetime(et_now2.year, et_now2.month, et_now2.day,
-                     0, 0, 0, tzinfo=ET).astimezone(timezone.utc)
-        )
-        return midnight_et
+        midnight_et = datetime(et_now.year, et_now.month, et_now.day,
+                               0, 0, 0, tzinfo=ET)
+        return midnight_et.astimezone(timezone.utc)
 
     def count_losses_today_broker(self, client) -> int:
         """
