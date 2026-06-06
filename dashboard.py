@@ -199,156 +199,195 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>KRONOS TERMINAL</title>
+<title>Kronos</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg:#0d1117;--card:#161b22;--border:#30363d;
-  --green:#3fb950;--glow:#00ff7f;--red:#f85149;
-  --yellow:#e3b341;--blue:#58a6ff;--dim:#8b949e;
-  --text:#c9d1d9;--font:'Courier New',monospace;
+  --bg:#131722;--surface:#1e222d;--surface2:#2a2e39;
+  --border:#2a2e39;--border2:#363a45;
+  --text:#d1d4dc;--muted:#787b86;
+  --green:#26a69a;--red:#ef5350;--blue:#2962ff;--orange:#ff9800;
+  --ui:-apple-system,BlinkMacSystemFont,'Segoe UI','Trebuchet MS',sans-serif;
+  --mono:'Courier New','Consolas',monospace;
 }
-body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:13px;min-height:100vh;display:flex;flex-direction:column}
+body{background:var(--bg);color:var(--text);font-family:var(--ui);font-size:13px;min-height:100vh;display:flex;flex-direction:column}
 
-/* header */
-.hdr{background:var(--card);border-bottom:1px solid var(--border);padding:10px 20px;display:flex;justify-content:space-between;align-items:center;flex-shrink:0}
-.logo{color:var(--glow);font-size:15px;font-weight:bold;letter-spacing:4px}
-.dot{display:inline-block;width:8px;height:8px;background:var(--glow);border-radius:50%;margin-left:8px;animation:blink 2s infinite}
-@keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
-.hdr-right{color:var(--dim);font-size:11px;text-align:right}
+/* topbar */
+.topbar{height:46px;background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 20px;flex-shrink:0}
+.logo{font-size:13px;font-weight:700;letter-spacing:.1em;color:var(--text);display:flex;align-items:center;gap:8px}
+.live-dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+.topbar-r{display:flex;align-items:center;gap:20px;color:var(--muted);font-size:12px}
+.topbar-clock{color:var(--text);font-variant-numeric:tabular-nums;font-family:var(--mono)}
 
-/* layout */
-.main{padding:14px;flex:1;display:flex;flex-direction:column;gap:14px}
-.row3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
-.row1{display:grid;grid-template-columns:1fr;gap:14px}
+/* main */
+.main{padding:16px;flex:1;display:flex;flex-direction:column;gap:12px}
 
-/* card */
-.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:15px}
-.ct{color:var(--dim);font-size:10px;letter-spacing:2px;text-transform:uppercase;padding-bottom:9px;margin-bottom:11px;border-bottom:1px solid var(--border)}
+/* metric strip */
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--border);border:1px solid var(--border);border-radius:6px;overflow:hidden}
+.metric{background:var(--surface);padding:14px 18px}
+.metric-label{font-size:11px;color:var(--muted);letter-spacing:.04em;margin-bottom:6px}
+.metric-value{font-size:21px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.2}
+.metric-sub{font-size:11px;color:var(--muted);margin-top:3px}
 
-/* account */
-.eq{font-size:26px;font-weight:bold;margin-bottom:4px}
-.pnl-up{color:var(--glow)}
-.pnl-dn{color:var(--red)}
-.rows{margin-top:11px;display:flex;flex-direction:column;gap:5px}
-.srow{display:flex;justify-content:space-between}
-.sl{color:var(--dim)}
-.sv{color:var(--text)}
-.sv.up{color:var(--glow)}
-.sv.dn{color:var(--red)}
+.up{color:var(--green)!important}
+.dn{color:var(--red)!important}
+.dim{color:var(--muted)!important}
 
-/* progress */
-.big{font-size:24px}
-.bsub{color:var(--dim);font-size:12px}
-.pb-wrap{margin:10px 0 6px}
-.pb-labels{display:flex;justify-content:space-between;font-size:10px;color:var(--dim);margin-bottom:3px}
-.pb-bg{background:var(--border);border-radius:3px;height:7px}
-.pb-fill{background:var(--glow);border-radius:3px;height:7px;transition:width .5s}
-.sig{margin-top:9px;padding-top:8px;border-top:1px solid var(--border);color:var(--dim);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* mid row */
+.mid{display:grid;grid-template-columns:1fr 300px;gap:12px}
+.left-stack{display:flex;flex-direction:column;gap:12px}
+.right-stack{display:flex;flex-direction:column;gap:12px}
 
-/* event */
-.ev-name{font-size:22px;color:var(--yellow);letter-spacing:3px;margin-bottom:6px}
-.cd{font-size:19px;color:var(--glow);margin-bottom:6px;font-variant-numeric:tabular-nums}
-.ev-sub{color:var(--dim);font-size:12px;line-height:1.8}
+/* panel */
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:6px;overflow:hidden}
+.ph{padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.pt{font-size:11px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--muted)}
+.pb-tag{font-size:10px;padding:2px 7px;border-radius:3px;background:var(--surface2);color:var(--muted)}
+.pb{padding:14px 16px}
+.pb-0{padding:0 16px}
 
 /* table */
-table{width:100%;border-collapse:collapse}
-th{color:var(--dim);font-size:10px;letter-spacing:1px;text-align:left;padding:3px 7px;border-bottom:1px solid var(--border)}
-td{padding:5px 7px;border-bottom:1px solid #1c2128;font-size:12px}
-tr:last-child td{border-bottom:none}
-.buy{color:var(--glow)}.sell{color:var(--red)}
-.pos-l{background:#1a3326;color:var(--glow);padding:1px 6px;border-radius:3px;font-size:10px}
-.pos-s{background:#331a1a;color:var(--red);padding:1px 6px;border-radius:3px;font-size:10px}
-.empty{color:var(--dim);padding:14px 7px;font-size:12px}
+.tv-table{width:100%;border-collapse:collapse}
+.tv-table th{text-align:left;font-size:11px;font-weight:500;color:var(--muted);padding:0 12px 8px 0;letter-spacing:.03em;border-bottom:1px solid var(--border)}
+.tv-table td{padding:8px 12px 8px 0;font-size:12px;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums}
+.tv-table tr:last-child td{border-bottom:none}
+.tv-table tbody tr:hover{background:rgba(255,255,255,.02)}
+
+.badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:3px;font-size:10px;font-weight:600;letter-spacing:.04em}
+.badge-long{background:rgba(38,166,154,.15);color:var(--green)}
+.badge-short{background:rgba(239,83,80,.15);color:var(--red)}
+.c-buy{color:var(--green)}
+.c-sell{color:var(--red)}
+
+/* progress */
+.prog-row{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px}
+.prog-big{font-size:28px;font-weight:700;font-variant-numeric:tabular-nums}
+.prog-sub{font-size:12px;color:var(--muted)}
+.pbar{width:100%;height:4px;background:var(--surface2);border-radius:2px;margin:6px 0 8px}
+.pbar-fill{height:4px;background:var(--blue);border-radius:2px;transition:width .6s ease}
+.sig-line{margin-top:10px;padding-top:10px;border-top:1px solid var(--border);font-size:11px;color:var(--muted);font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* event */
+.ev-name{font-size:22px;font-weight:700;letter-spacing:.03em;margin-bottom:4px}
+.ev-cd{font-size:16px;font-variant-numeric:tabular-nums;color:var(--green);font-weight:500;font-family:var(--mono);margin-bottom:8px}
+.ev-meta{font-size:12px;color:var(--muted);line-height:1.9}
 
 /* log */
-.log-box{background:#080c10;border-radius:5px;padding:11px;height:200px;overflow-y:auto;font-size:11px;line-height:1.65}
-.ll{color:#3d4f5e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.ll.order{color:var(--glow)}
+.log-feed{font-family:var(--mono);font-size:11px;line-height:1.7;height:190px;overflow-y:auto;padding:12px 16px}
+.ll{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ll.order{color:var(--green)}
 .ll.halt{color:var(--red)}
-.ll.em{color:var(--yellow)}
+.ll.warn{color:var(--orange)}
 .ll.sig{color:var(--text)}
-.ll.warn{color:var(--yellow)}
+
+/* scrollbar */
+::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--surface2);border-radius:2px}
 
 /* footer */
-.ftr{background:var(--card);border-top:1px solid var(--border);padding:6px 20px;font-size:10px;color:var(--dim);letter-spacing:1px;text-align:center;flex-shrink:0}
+.footer{padding:8px 20px;border-top:1px solid var(--border);display:flex;justify-content:space-between;font-size:10px;color:var(--muted);letter-spacing:.04em;flex-shrink:0}
 
-/* loading */
-.ld{color:var(--dim);animation:ld 1s step-end infinite}
-@keyframes ld{50%{opacity:0}}
+.empty{color:var(--muted);font-size:12px;padding:12px 0}
+.loading{color:var(--muted);font-size:12px;animation:fade 1s step-end infinite}
+@keyframes fade{50%{opacity:0}}
 
-@media(max-width:880px){.row3{grid-template-columns:1fr}}
+@media(max-width:900px){
+  .metrics{grid-template-columns:repeat(2,1fr)}
+  .mid{grid-template-columns:1fr}
+}
 </style>
 </head>
 <body>
 
-<div class="hdr">
-  <div style="display:flex;align-items:center;gap:10px">
-    <span class="logo">⬡ KRONOS</span>
-    <span class="dot"></span>
-    <span style="color:var(--dim);font-size:11px" id="clock">—</span>
+<div class="topbar">
+  <div class="logo">
+    <div class="live-dot"></div>
+    Kronos
   </div>
-  <div class="hdr-right">
-    <div id="upd">connecting...</div>
+  <div class="topbar-r">
+    <span class="topbar-clock" id="clock">—</span>
+    <span id="upd" style="color:var(--muted)">connecting...</span>
   </div>
 </div>
 
 <div class="main">
 
-  <div class="row3">
-    <div class="card" id="c-acct"><div class="ct">Account</div><div class="ld">fetching...</div></div>
-    <div class="card" id="c-ict"><div class="ct">ICT Bot</div><div class="ld">fetching...</div></div>
-    <div class="card" id="c-ev"><div class="ct">Next Event</div><div class="ld">fetching...</div></div>
+  <div class="metrics" id="metrics">
+    <div class="metric"><div class="metric-label">Equity</div><div class="metric-value loading">—</div></div>
+    <div class="metric"><div class="metric-label">Today</div><div class="metric-value loading">—</div></div>
+    <div class="metric"><div class="metric-label">From $100K</div><div class="metric-value loading">—</div></div>
+    <div class="metric"><div class="metric-label">Peak DD</div><div class="metric-value loading">—</div></div>
   </div>
 
-  <div class="row1">
-    <div class="card" id="c-fills"><div class="ct">Recent Fills · 7 days</div><div class="ld">fetching...</div></div>
-  </div>
-
-  <div class="row1">
-    <div class="card">
-      <div class="ct">ICT Log Feed</div>
-      <div class="log-box" id="log-ict"><div class="ll">loading...</div></div>
+  <div class="mid">
+    <div class="left-stack">
+      <div class="panel" id="c-positions">
+        <div class="ph"><span class="pt">Open Positions</span></div>
+        <div class="pb"><div class="loading">loading...</div></div>
+      </div>
+      <div class="panel" id="c-fills">
+        <div class="ph"><span class="pt">Recent Fills</span><span class="pb-tag">7 days</span></div>
+        <div class="pb"><div class="loading">loading...</div></div>
+      </div>
     </div>
+    <div class="right-stack">
+      <div class="panel" id="c-ict">
+        <div class="ph"><span class="pt">ICT Paper</span></div>
+        <div class="pb"><div class="loading">loading...</div></div>
+      </div>
+      <div class="panel" id="c-ev">
+        <div class="ph"><span class="pt">Next Event</span></div>
+        <div class="pb"><div class="loading">loading...</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="ph"><span class="pt">ICT Log</span><span class="pb-tag" id="log-ts">—</span></div>
+    <div class="log-feed" id="log-ict"></div>
   </div>
 
 </div>
 
-<div class="ftr">KRONOS TERMINAL &nbsp;·&nbsp; ALPACA PAPER &nbsp;·&nbsp; VPS 144.202.3.195 &nbsp;·&nbsp; AUTO-REFRESH 30s</div>
+<div class="footer">
+  <span>Kronos · Alpaca Paper · VPS 144.202.3.195</span>
+  <span>auto-refresh 30s</span>
+</div>
 
 <script>
-// clock
 (function tick(){
-  const s=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(new Date());
-  document.getElementById('clock').textContent=s+' ET';
+  document.getElementById('clock').textContent=
+    new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(new Date())+' ET';
   setTimeout(tick,1000);
 })();
 
-// countdown
-let evSec=0, cdTimer=null;
+let evSec=0,cdTimer=null;
 function startCd(s){
   evSec=s;
   if(cdTimer)clearInterval(cdTimer);
   cdTimer=setInterval(()=>{
     evSec=Math.max(0,evSec-1);
-    const d=Math.floor(evSec/86400),h=Math.floor((evSec%86400)/3600),m=Math.floor((evSec%3600)/60),s=evSec%60;
     const el=document.getElementById('cd');
-    if(el)el.textContent=d+'d '+pad(h)+'h '+pad(m)+'m '+pad(s)+'s';
+    if(el)el.textContent=fmtCd(evSec);
   },1000);
 }
-function pad(n){return String(n).padStart(2,'0');}
-function f2(n){return n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g,',');}
-function dollar(n,always=false){const s=(n>=0?'+':'-');return(n>=0&&always?'+':n<0?'-':'')+'$'+Math.abs(n).toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g,',');}
+function fmtCd(s){const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60),sc=s%60;return d+'d '+p2(h)+'h '+p2(m)+'m '+p2(sc)+'s';}
+function p2(n){return String(n).padStart(2,'0');}
+function fmtMoney(n,sign=true){const abs='$'+Math.abs(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});return sign?(n>=0?'+':'-')+abs:abs;}
+function fmtPct(n,sign=true){return(sign&&n>=0?'+':'')+n.toFixed(2)+'%';}
 
 async function loadData(){
   try{
     const r=await fetch('/api/data'),d=await r.json();
-    document.getElementById('upd').textContent='updated '+d.ts;
-    renderAcct(d.account);
+    document.getElementById('upd').textContent='updated '+d.ts.split(' ')[1]+' ET';
+    renderMetrics(d.account);
+    renderPositions(d.account.positions||[]);
+    renderFills(d.account.fills||[]);
     renderICT(d.account,d.last_signal);
-    renderEv(d.event);
-    renderFills(d.account.fills||[],d.account.positions||[]);
-  }catch(e){document.getElementById('upd').textContent='⚠ '+e;}
+    renderEvent(d.event);
+  }catch(e){document.getElementById('upd').textContent='error';}
 }
 
 async function loadLogs(){
@@ -359,86 +398,114 @@ async function loadLogs(){
     feed.innerHTML=lines.map(l=>{
       let c='ll';
       if(l.includes('[ORDER]')||l.includes('FILL'))c+=' order';
-      else if(l.includes('[HALT]')||l.includes('breach')||l.includes('ERROR'))c+=' halt';
-      else if(l.includes('EMBARGO')||l.includes('[WARN]'))c+=' em';
+      else if(l.includes('[HALT]')||l.includes('ERROR')||l.includes('breach'))c+=' halt';
+      else if(l.includes('EMBARGO')||l.includes('[WARN]')||l.includes('[NEAR_MISS]'))c+=' warn';
       else if(l.includes('Signal:')&&!l.includes('HOLD'))c+=' sig';
-      else if(l.includes('[NEAR_MISS]'))c+=' warn';
       return`<div class="${c}">${l.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>`;
     }).join('');
     feed.scrollTop=feed.scrollHeight;
+    const last=lines.length&&lines[lines.length-1].match(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
+    if(last)document.getElementById('log-ts').textContent=last[0];
   }catch(e){}
 }
 
-function renderAcct(a){
-  if(a.error){
-    document.getElementById('c-acct').innerHTML=`<div class="ct">Account</div><div style="color:var(--red);font-size:12px">${a.error}</div>`;return;
-  }
-  const up=a.pnl>=0,dd=a.dd_pct>=0;
-  document.getElementById('c-acct').innerHTML=`
-    <div class="ct">Account</div>
-    <div class="eq">$${f2(a.equity)}</div>
-    <div class="${up?'pnl-up':'pnl-dn'}">${dollar(a.pnl,true)} (${a.pnl_pct>=0?'+':''}${a.pnl_pct.toFixed(2)}%)</div>
-    <div class="rows">
-      <div class="srow"><span class="sl">From $100K</span><span class="sv ${a.from_100k>=0?'up':'dn'}">${dollar(a.from_100k,true)}</span></div>
-      <div class="srow"><span class="sl">DD from peak</span><span class="sv ${dd?'up':'dn'}">${a.dd_pct>=0?'+':''}${a.dd_pct.toFixed(2)}%</span></div>
-      <div class="srow"><span class="sl">Positions</span><span class="sv">${a.positions&&a.positions.length?a.positions.length+' open':'flat'}</span></div>
+function renderMetrics(a){
+  if(a.error)return;
+  const m=document.getElementById('metrics');
+  const pos=a.positions&&a.positions.length;
+  m.innerHTML=`
+    <div class="metric">
+      <div class="metric-label">Equity</div>
+      <div class="metric-value">$${a.equity.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}</div>
+      <div class="metric-sub">${pos?pos+' position'+(pos>1?'s':'')+' open':'flat'}</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Today</div>
+      <div class="metric-value ${a.pnl>=0?'up':'dn'}">${fmtMoney(a.pnl)}</div>
+      <div class="metric-sub ${a.pnl>=0?'up':'dn'}">${fmtPct(a.pnl_pct)}</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">From $100K</div>
+      <div class="metric-value ${a.from_100k>=0?'up':'dn'}">${fmtMoney(a.from_100k)}</div>
+      <div class="metric-sub dim">all-time</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Peak DD</div>
+      <div class="metric-value ${a.dd_pct>=0?'dim':'dn'}">${fmtPct(a.dd_pct,false)}</div>
+      <div class="metric-sub dim">from $100K</div>
     </div>`;
+}
+
+function renderPositions(positions){
+  const el=document.getElementById('c-positions');
+  if(!positions.length){
+    el.innerHTML=`<div class="ph"><span class="pt">Open Positions</span></div><div class="pb"><div class="empty">No open positions</div></div>`;return;
+  }
+  const rows=positions.map(p=>`<tr>
+    <td><span class="badge ${p.side==='long'?'badge-long':'badge-short'}">${p.side.toUpperCase()}</span></td>
+    <td style="font-weight:600">${p.symbol}</td>
+    <td style="color:var(--muted)">${Math.abs(p.qty).toLocaleString()}</td>
+    <td>$${p.entry.toFixed(2)}</td>
+    <td class="${p.pnl>=0?'up':'dn'}">${fmtMoney(p.pnl)}</td>
+    <td class="${p.pnl_pct>=0?'up':'dn'}" style="font-size:11px;color:var(--muted)">${fmtPct(p.pnl_pct)}</td>
+  </tr>`).join('');
+  el.innerHTML=`
+    <div class="ph"><span class="pt">Open Positions</span><span class="pb-tag">${positions.length}</span></div>
+    <div class="pb-0"><table class="tv-table">
+      <thead><tr><th>Side</th><th>Symbol</th><th>Qty</th><th>Entry</th><th>P&L</th><th>%</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`;
+}
+
+function renderFills(fills){
+  const el=document.getElementById('c-fills');
+  if(!fills.length){
+    el.innerHTML=`<div class="ph"><span class="pt">Recent Fills</span><span class="pb-tag">7 days</span></div><div class="pb"><div class="empty">No fills</div></div>`;return;
+  }
+  const rows=fills.map(f=>`<tr>
+    <td style="color:var(--muted);font-size:11px">${f.time}</td>
+    <td class="${f.side==='BUY'?'c-buy':'c-sell'}">${f.side}</td>
+    <td style="color:var(--muted)">${f.qty.toLocaleString()}</td>
+    <td style="font-weight:600">${f.symbol}</td>
+    <td>$${f.price.toFixed(2)}</td>
+  </tr>`).join('');
+  el.innerHTML=`
+    <div class="ph"><span class="pt">Recent Fills</span><span class="pb-tag">7 days</span></div>
+    <div class="pb-0"><table class="tv-table">
+      <thead><tr><th>Time</th><th>Side</th><th>Qty</th><th>Symbol</th><th>Price</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`;
 }
 
 function renderICT(a,sig){
   const n=a.spy_count||0,t=30,pct=Math.min(100,n/t*100);
   document.getElementById('c-ict').innerHTML=`
-    <div class="ct">ICT Bot · Alpaca Paper</div>
-    <div><span class="big">${n}</span><span class="bsub"> / ${t} paper trades</span></div>
-    <div class="pb-wrap">
-      <div class="pb-labels"><span>PROGRESS TO CHALLENGE</span><span>${pct.toFixed(0)}%</span></div>
-      <div class="pb-bg"><div class="pb-fill" style="width:${pct}%"></div></div>
-    </div>
-    <div class="srow"><span class="sl">Remaining</span><span class="sv">${t-n} trades</span></div>
-    <div class="sig" title="${sig||'—'}">${sig||'—'}</div>`;
-}
-
-function renderEv(e){
-  if(!e||e.name==='—'){
-    document.getElementById('c-ev').innerHTML='<div class="ct">Next Event</div><div class="empty">No events scheduled</div>';return;
-  }
-  document.getElementById('c-ev').innerHTML=`
-    <div class="ct">Next Event</div>
-    <div class="ev-name">${e.name}</div>
-    <div class="cd" id="cd">${e.days}d ${pad(e.hours)}h ${pad(e.minutes)}m ${pad(e.seconds)}s</div>
-    <div class="ev-sub">${e.date}</div>
-    <div class="ev-sub">${e.time}</div>`;
-  if(e.total)startCd(e.total);
-}
-
-function renderFills(fills,positions){
-  let html='<div class="ct">Recent Fills · 7 days</div>';
-  if(positions&&positions.length){
-    const pbody=positions.map(p=>`
-      <tr>
-        <td><span class="${p.side==='long'?'pos-l':'pos-s'}">${p.side.toUpperCase()}</span></td>
-        <td>${p.symbol}</td>
-        <td>${p.qty}</td>
-        <td>$${p.entry.toFixed(2)}</td>
-        <td class="${p.pnl>=0?'pnl-up':'pnl-dn'}">${dollar(p.pnl,true)}</td>
-      </tr>`).join('');
-    html+=`<div style="margin-bottom:10px">
-      <div style="color:var(--dim);font-size:10px;letter-spacing:1px;margin-bottom:5px">OPEN POSITIONS</div>
-      <table><thead><tr><th>SIDE</th><th>SYM</th><th>QTY</th><th>ENTRY</th><th>PNL</th></tr></thead><tbody>${pbody}</tbody></table>
+    <div class="ph"><span class="pt">ICT Paper</span></div>
+    <div class="pb">
+      <div class="prog-row">
+        <div><span class="prog-big">${n}</span><span class="prog-sub"> / ${t}</span></div>
+        <span style="font-size:11px;color:var(--muted)">${pct.toFixed(0)}%</span>
+      </div>
+      <div class="pbar"><div class="pbar-fill" style="width:${pct}%"></div></div>
+      <div style="font-size:11px;color:var(--muted)">${t-n} trades to challenge</div>
+      <div class="sig-line" title="${sig||'—'}">${sig||'—'}</div>
     </div>`;
+}
+
+function renderEvent(e){
+  const el=document.getElementById('c-ev');
+  if(!e||e.name==='—'){
+    el.innerHTML=`<div class="ph"><span class="pt">Next Event</span></div><div class="pb"><div class="empty">No events scheduled</div></div>`;return;
   }
-  if(!fills||!fills.length){html+='<div class="empty">No fills in last 7 days</div>';}
-  else{
-    const rows=fills.map(f=>`<tr>
-      <td style="color:var(--dim)">${f.time}</td>
-      <td class="${f.side==='BUY'?'buy':'sell'}">${f.side}</td>
-      <td>${f.qty}</td>
-      <td>${f.symbol}</td>
-      <td>$${f.price.toFixed(2)}</td>
-    </tr>`).join('');
-    html+=`<table><thead><tr><th>TIME</th><th>SIDE</th><th>QTY</th><th>SYM</th><th>PRICE</th></tr></thead><tbody>${rows}</tbody></table>`;
-  }
-  document.getElementById('c-fills').innerHTML=html;
+  el.innerHTML=`
+    <div class="ph"><span class="pt">Next Event</span></div>
+    <div class="pb">
+      <div class="ev-name">${e.name}</div>
+      <div class="ev-cd" id="cd">${fmtCd(e.total||0)}</div>
+      <div class="ev-meta">${e.date}</div>
+      <div class="ev-meta">${e.time}</div>
+    </div>`;
+  if(e.total)startCd(e.total);
 }
 
 loadData();loadLogs();
