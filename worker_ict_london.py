@@ -3,7 +3,7 @@ Worker 3 — ICT London Kill Zone Sniper
 ========================================
 Session  : London Kill Zone — 3:00 AM to 5:00 AM ET
 Cron UTC : */5 7,8 * * 1-5   (07:00–09:00 UTC = 3:00–5:00 AM ET)
-Account  : ICT-Challenge paper account (.env.ict)
+Account  : ICT-London paper account (.env.ict_london)
 Log dir  : ~/logs/ict_london/
 Lock     : /tmp/worker_ict_london.lock
 
@@ -45,7 +45,7 @@ import yfinance as yf
 
 # ── Worker identity ───────────────────────────────────────────────────────────
 WORKER_NAME  = "ict_london"
-ENV_FILE     = str(Path(__file__).parent / ".env.ict")
+ENV_FILE     = str(Path(__file__).parent / ".env.ict_london")
 LOG_DIR      = str(Path.home() / "logs" / "ict_london")
 LOCK_FILE    = "/tmp/worker_ict_london.lock"
 STATE_FILE   = Path.home() / "logs/ict_london/ict_london_state.json"
