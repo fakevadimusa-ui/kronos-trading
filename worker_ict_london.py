@@ -73,10 +73,22 @@ WINDOW_CLOSE = (5, 0)        # 5:00 AM ET
 DAILY_LOSS_LIMIT = 2
 
 # ── Bootstrap shared utilities ────────────────────────────────────────────────
-from worker_shared import make_logger, load_credentials, send_telegram, RunLock
+from worker_shared import (
+    make_logger, load_credentials, send_telegram, RunLock, WorkerGuards
+)
 
-log  = make_logger(WORKER_NAME, LOG_DIR)
-lock = RunLock(LOCK_FILE, log)
+log    = make_logger(WORKER_NAME, LOG_DIR)
+lock   = RunLock(LOCK_FILE, log)
+guards = WorkerGuards(
+    worker_name            = WORKER_NAME,
+    log_dir                = LOG_DIR,
+    symbol                 = SYMBOL,
+    env_file               = ENV_FILE,
+    circuit_breaker_losses = DAILY_LOSS_LIMIT,
+    daily_dd_limit         = -0.04,
+    total_dd_limit         = -0.08,
+    trailing_dd_limit      = 0.04,
+)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -349,26 +361,78 @@ def main() -> None:
         log.info("═" * 55)
         log.info(f"ICT London Sniper tick — {now_et.strftime('%Y-%m-%d %H:%M %Z')}")
 
-        losses = get_loss_count()
-        if losses >= DAILY_LOSS_LIMIT:
-            log.info(f"Daily loss limit ({losses}/{DAILY_LOSS_LIMIT}) — standing down.")
+        client = get_alpaca_client()
+
+        # ── [E] Orphan reaper ──────────────────────────────────────────────
+        guards.orphan_reaper(client)
+
+        # ── [B] Day-lock check ─────────────────────────────────────────────
+        if guards.is_day_locked():
+            log.info("Day-lock active — standing down.")
             return
 
-        client = get_alpaca_client()
-        acct   = client.get_account()
-        equity = float(acct.equity)
-        log.info(f"ICT-Challenge equity: ${equity:,.2f}  losses today: {losses}/{DAILY_LOSS_LIMIT}")
+        # ── [G] Fail-closed DD checks ──────────────────────────────────────
+        if not guards.run_risk_preamble(client):
+            return
 
+        equity = guards.get_equity(client)
+        log.info(f"ICT-London equity: ${equity:,.2f}")
+
+        # ── [C] Spread baseline ────────────────────────────────────────────
+        guards.refresh_spread_baseline(client)
+
+        # ── [A] News embargo ───────────────────────────────────────────────
+        if guards.is_embargo_active():
+            log.info("News embargo active — no entry.")
+            return
+
+        # ── [D] Broker-first loss count ────────────────────────────────────
+        try:
+            broker_losses = guards.count_losses_today_broker(client)
+        except Exception as e:
+            log.error(f"[HALT] Broker loss count failed — standing down: {e}")
+            return
+
+        log.info(f"Broker losses today: {broker_losses}/{DAILY_LOSS_LIMIT}")
+
+        if broker_losses >= DAILY_LOSS_LIMIT:
+            log.info("Daily loss limit reached — standing down.")
+            return
+
+        # ── [B] Circuit breaker magnitude ──────────────────────────────────
+        if guards.check_circuit_breaker(client):
+            guards.engage_day_lock(f"{broker_losses} losses — magnitude confirmed", broker_losses)
+            sys.exit(0)
+
+        # ── Manage open position ───────────────────────────────────────────
         state    = load_state()
         live_pos = get_position(client, SYMBOL)
 
         if state and not live_pos:
             log.info(f"Bracket exit — {state['side']} @ {state['entry']}")
-            send_telegram(
-                f"ICT London Bracket Exit\n"
-                f"{state['side']} {state['contracts']}x {SYMBOL}\n"
-                f"SL: {state['sl']}  TP: {state['tp']}", log
-            )
+            try:
+                from alpaca.trading.requests import GetOrdersRequest
+                from alpaca.trading.enums    import QueryOrderStatus
+                recent = client.get_orders(filter=GetOrdersRequest(
+                    status=QueryOrderStatus.ALL, symbols=[SYMBOL], limit=10))
+                filled = [o for o in recent if o.filled_at and o.filled_avg_price]
+                filled.sort(key=lambda o: o.filled_at, reverse=True)
+                if filled:
+                    exit_px   = float(filled[0].filled_avg_price)
+                    entry_px  = state["entry"]
+                    contracts = state["contracts"]
+                    pnl = ((exit_px - entry_px) if state["side"] == "BUY"
+                           else (entry_px - exit_px)) * contracts * ES_MULT
+                    if pnl >= 0:
+                        guards.record_win(pnl)
+                        send_telegram(f"✅ ICT London WIN\n{state['side']} "
+                                      f"{contracts}x {SYMBOL}\nP&L: ${pnl:+,.2f}", log)
+                    else:
+                        guards.record_loss(pnl, "bracket_exit")
+                        send_telegram(f"❌ ICT London LOSS\n{state['side']} "
+                                      f"{contracts}x {SYMBOL}\nP&L: ${pnl:+,.2f}", log)
+            except Exception as e:
+                log.warning(f"Could not determine exit P&L: {e}")
             clear_state()
             state = None
 
@@ -377,12 +441,12 @@ def main() -> None:
             if entry_time:
                 bars_open = int((now_et.replace(tzinfo=None) -
                                  entry_time.replace(tzinfo=None)).total_seconds() / 300)
-                log.info(f"Open position: {live_pos.side.value} bars_open={bars_open}/{STAGNATION_BARS}")
+                log.info(f"Open: {live_pos.side.value} bars_open={bars_open}/{STAGNATION_BARS}")
                 if bars_open >= STAGNATION_BARS:
                     log.warning(f"STAGNATION EXIT after {bars_open} bars")
                     close_position(client, SYMBOL)
-                    send_telegram(f"⏰ ICT London STAGNATION EXIT\n{SYMBOL} {bars_open} bars", log)
-                    record_loss()
+                    guards.record_loss(-1.0, "stagnation")
+                    send_telegram(f"⏰ ICT London STAGNATION EXIT\n{SYMBOL}", log)
                     clear_state()
             return
 
@@ -402,17 +466,26 @@ def main() -> None:
         if not sig:
             return
 
+        # ── [F] Bouncer + Decoy Detector ───────────────────────────────────
+        bar_ts = str(df.index[-1])
+        if not guards.is_signal_valid(sig["side"], bar_ts):
+            return
+
+        # ── [C] Spread gate ────────────────────────────────────────────────
+        if not guards.check_spread_gate():
+            log.info("Spread gate blocked entry.")
+            return
+
         dollar_risk = sig["contracts"] * sig["risk"] * ES_MULT
         log.info(f"ENTRY {sig['side']} {sig['contracts']}x {SYMBOL}  "
                  f"entry≈{sig['entry']}  sl={sig['sl']}  tp={sig['tp']}  "
-                 f"risk_pts={sig['risk']}  dollar_risk=${dollar_risk:.0f}")
+                 f"risk=${dollar_risk:.0f}")
 
         try:
             order_id = place_bracket(client, SYMBOL, sig["side"],
                                      sig["contracts"], sig["entry"],
                                      sig["sl"], sig["tp"])
-            save_state({**sig, "order_id": order_id,
-                        "entry_time": now_et.isoformat()})
+            save_state({**sig, "order_id": order_id, "entry_time": now_et.isoformat()})
             send_telegram(
                 f"{'🟢' if sig['side']=='BUY' else '🔴'} ICT London {sig['side']}\n"
                 f"{sig['contracts']}x {SYMBOL}\n"
