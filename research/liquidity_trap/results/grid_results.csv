@@ -1,0 +1,28 @@
+variant,target_r,min_sweep_pts,n_trades,win_rate,profit_factor,expectancy_pts,total_pts,max_dd_pts,trades_per_day,grade
+A,1.5,0.25,19,0.5263,1.837,1.933,36.72,-18.2,1.0,"C — Weak edge, research-only"
+A,1.5,0.5,18,0.5,1.58,1.511,27.2,-21.2,1.0,"C — Weak edge, research-only"
+A,1.5,1.0,14,0.6429,3.927,4.704,65.85,-7.95,1.0,"A — Strong edge, viable for live trading"
+A,2.0,0.25,19,0.4737,1.564,1.505,28.6,-28.6,1.0,REJECT — Below minimum thresholds
+A,2.0,0.5,18,0.4444,1.311,0.928,16.7,-37.2,1.0,REJECT — Below minimum thresholds
+A,2.0,1.0,14,0.5714,3.048,4.293,60.1,-14.8,1.0,"B — Moderate edge, needs more validation"
+A,3.0,0.25,19,0.4211,1.115,0.387,7.35,-28.6,1.0,REJECT — Below minimum thresholds
+A,3.0,0.5,18,0.3889,0.883,-0.433,-7.8,-43.6,1.0,REJECT — No edge after friction
+A,3.0,1.0,14,0.5,1.774,2.346,32.85,-14.8,1.0,"C — Weak edge, research-only"
+B,1.5,0.25,48,0.4167,1.196,0.574,27.57,-44.65,1.33,REJECT — Below minimum thresholds
+B,1.5,0.5,47,0.4468,1.302,0.865,40.67,-44.65,1.31,REJECT — Below minimum thresholds
+B,1.5,1.0,41,0.4146,1.148,0.47,19.27,-34.05,1.21,REJECT — Below minimum thresholds
+B,2.0,0.25,48,0.3958,1.402,1.202,57.7,-44.65,1.33,REJECT — Below minimum thresholds
+B,2.0,0.5,47,0.4043,1.444,1.336,62.8,-44.65,1.31,REJECT — Below minimum thresholds
+B,2.0,1.0,41,0.3902,1.314,1.016,41.65,-34.05,1.21,REJECT — Below minimum thresholds
+B,3.0,0.25,44,0.2955,1.148,0.531,23.35,-69.9,1.22,REJECT — Below minimum thresholds
+B,3.0,0.5,43,0.3023,1.192,0.697,29.95,-71.9,1.19,REJECT — Below minimum thresholds
+B,3.0,1.0,38,0.3158,1.095,0.367,13.95,-57.2,1.12,REJECT — Below minimum thresholds
+C,1.5,0.25,10,0.3,0.41,-2.062,-20.62,-31.6,1.0,REJECT — No edge after friction
+C,1.5,0.5,10,0.3,0.41,-2.062,-20.62,-31.6,1.0,REJECT — No edge after friction
+C,1.5,1.0,9,0.2222,0.324,-2.85,-25.65,-34.1,1.0,C — Insufficient trades (<10)
+C,2.0,0.25,10,0.3,0.564,-1.525,-15.25,-31.6,1.0,REJECT — No edge after friction
+C,2.0,0.5,10,0.3,0.564,-1.525,-15.25,-31.6,1.0,REJECT — No edge after friction
+C,2.0,1.0,9,0.2222,0.443,-2.35,-21.15,-34.1,1.0,C — Insufficient trades (<10)
+C,3.0,0.25,10,0.2,0.288,-2.85,-28.5,-32.05,1.0,REJECT — No edge after friction
+C,3.0,0.5,10,0.2,0.288,-2.85,-28.5,-32.05,1.0,REJECT — No edge after friction
+C,3.0,1.0,9,0.1111,0.16,-4.017,-36.15,-39.2,1.0,C — Insufficient trades (<10)

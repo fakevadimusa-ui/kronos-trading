@@ -1,0 +1,497 @@
+{
+  "data_source": "ES_5min_Alpaca",
+  "date_range": {
+    "start": "2026-04-07",
+    "end": "2026-06-05"
+  },
+  "n_trading_days": 51,
+  "n_bars": 11353,
+  "variants": {
+    "A": {
+      "metrics": {
+        "n_trades": 19,
+        "n_days": 19,
+        "trades_per_day": 1.0,
+        "n_wins": 9,
+        "n_losses": 10,
+        "win_rate": 0.4737,
+        "avg_win_pts": 8.817,
+        "avg_loss_pts": -5.075,
+        "profit_factor": 1.564,
+        "expectancy_pts": 1.505,
+        "total_pts": 28.6,
+        "max_dd_pts": -28.6,
+        "max_consec_loss": 3,
+        "sharpe": 3.312,
+        "avg_hold_bars": 5.5,
+        "avg_risk_pts": 5.07,
+        "avg_reward_pts": 10.13,
+        "realized_rr": 1.74,
+        "long_wr": 0.4,
+        "short_wr": 0.5,
+        "exit_tp": 7,
+        "exit_sl": 10,
+        "exit_time": 2,
+        "exit_eod": 0,
+        "gross_profit_pts": 79.35,
+        "gross_loss_pts": 50.75
+      },
+      "grade": "REJECT \u2014 Below minimum thresholds",
+      "prop_sim": [
+        {
+          "risk_mode": "SAFE",
+          "n_sims": 2000,
+          "pass_rate": 0.682,
+          "blow_rate": 0.114,
+          "timeout_rate": 0.204,
+          "avg_days_to_pass": 97.3,
+          "median_days_pass": 95.0,
+          "avg_days_to_blow": 58.4,
+          "avg_max_dd": -2578.63,
+          "avg_max_dd_pass": -2014.81,
+          "avg_contracts": 15,
+          "monthly_gross_est": 2371.0,
+          "monthly_net_est": 1897.0,
+          "risk_per_trade": 300.0,
+          "trades_per_day_input": 1.0
+        },
+        {
+          "risk_mode": "NORMAL",
+          "n_sims": 2000,
+          "pass_rate": 0.851,
+          "blow_rate": 0.1395,
+          "timeout_rate": 0.0095,
+          "avg_days_to_pass": 54.7,
+          "median_days_pass": 47.0,
+          "avg_days_to_blow": 31.8,
+          "avg_max_dd": -2474.59,
+          "avg_max_dd_pass": -2191.66,
+          "avg_contracts": 20,
+          "monthly_gross_est": 3161.0,
+          "monthly_net_est": 2529.0,
+          "risk_per_trade": 500.0,
+          "trades_per_day_input": 1.0
+        },
+        {
+          "risk_mode": "AGGRESSIVE",
+          "n_sims": 2000,
+          "pass_rate": 0.8675,
+          "blow_rate": 0.1315,
+          "timeout_rate": 0.001,
+          "avg_days_to_pass": 41.2,
+          "median_days_pass": 35.0,
+          "avg_days_to_blow": 26.7,
+          "avg_max_dd": -2425.4,
+          "avg_max_dd_pass": -2141.96,
+          "avg_contracts": 20,
+          "monthly_gross_est": 3161.0,
+          "monthly_net_est": 2529.0,
+          "risk_per_trade": 800.0,
+          "trades_per_day_input": 1.0
+        }
+      ]
+    },
+    "B": {
+      "metrics": {
+        "n_trades": 48,
+        "n_days": 36,
+        "trades_per_day": 1.33,
+        "n_wins": 19,
+        "n_losses": 29,
+        "win_rate": 0.3958,
+        "avg_win_pts": 10.584,
+        "avg_loss_pts": -4.945,
+        "profit_factor": 1.402,
+        "expectancy_pts": 1.202,
+        "total_pts": 57.7,
+        "max_dd_pts": -44.65,
+        "max_consec_loss": 6,
+        "sharpe": 2.42,
+        "avg_hold_bars": 6.9,
+        "avg_risk_pts": 4.99,
+        "avg_reward_pts": 9.98,
+        "realized_rr": 2.14,
+        "long_wr": 0.4444,
+        "short_wr": 0.3667,
+        "exit_tp": 16,
+        "exit_sl": 27,
+        "exit_time": 1,
+        "exit_eod": 4,
+        "gross_profit_pts": 201.1,
+        "gross_loss_pts": 143.4
+      },
+      "grade": "REJECT \u2014 Below minimum thresholds",
+      "prop_sim": [
+        {
+          "risk_mode": "SAFE",
+          "n_sims": 2000,
+          "pass_rate": 0.4225,
+          "blow_rate": 0.4375,
+          "timeout_rate": 0.14,
+          "avg_days_to_pass": 86.7,
+          "median_days_pass": 80.0,
+          "avg_days_to_blow": 58.3,
+          "avg_max_dd": -3787.25,
+          "avg_max_dd_pass": -2620.87,
+          "avg_contracts": 15,
+          "monthly_gross_est": 2518.0,
+          "monthly_net_est": 2014.0,
+          "risk_per_trade": 300.0,
+          "trades_per_day_input": 1.33
+        },
+        {
+          "risk_mode": "NORMAL",
+          "n_sims": 2000,
+          "pass_rate": 0.6145,
+          "blow_rate": 0.3665,
+          "timeout_rate": 0.019,
+          "avg_days_to_pass": 59.3,
+          "median_days_pass": 51.0,
+          "avg_days_to_blow": 38.4,
+          "avg_max_dd": -3514.12,
+          "avg_max_dd_pass": -2772.84,
+          "avg_contracts": 20,
+          "monthly_gross_est": 3357.0,
+          "monthly_net_est": 2686.0,
+          "risk_per_trade": 500.0,
+          "trades_per_day_input": 1.33
+        },
+        {
+          "risk_mode": "AGGRESSIVE",
+          "n_sims": 2000,
+          "pass_rate": 0.6705,
+          "blow_rate": 0.3275,
+          "timeout_rate": 0.002,
+          "avg_days_to_pass": 40.5,
+          "median_days_pass": 33.0,
+          "avg_days_to_blow": 27.1,
+          "avg_max_dd": -3255.42,
+          "avg_max_dd_pass": -2584.5,
+          "avg_contracts": 20,
+          "monthly_gross_est": 3357.0,
+          "monthly_net_est": 2686.0,
+          "risk_per_trade": 800.0,
+          "trades_per_day_input": 1.33
+        }
+      ]
+    },
+    "C": {
+      "metrics": {
+        "n_trades": 10,
+        "n_days": 10,
+        "trades_per_day": 1.0,
+        "n_wins": 3,
+        "n_losses": 7,
+        "win_rate": 0.3,
+        "avg_win_pts": 6.567,
+        "avg_loss_pts": -4.993,
+        "profit_factor": 0.564,
+        "expectancy_pts": -1.525,
+        "total_pts": -15.25,
+        "max_dd_pts": -31.6,
+        "max_consec_loss": 6,
+        "sharpe": -5.219,
+        "avg_hold_bars": 7.3,
+        "avg_risk_pts": 3.95,
+        "avg_reward_pts": 7.9,
+        "realized_rr": 1.32,
+        "long_wr": 0.2,
+        "short_wr": 0.4,
+        "exit_tp": 3,
+        "exit_sl": 6,
+        "exit_time": 0,
+        "exit_eod": 1,
+        "gross_profit_pts": 19.7,
+        "gross_loss_pts": 34.95
+      },
+      "grade": "REJECT \u2014 No edge after friction",
+      "prop_sim": [
+        {
+          "risk_mode": "SAFE",
+          "n_sims": 2000,
+          "pass_rate": 0.0,
+          "blow_rate": 1.0,
+          "timeout_rate": 0.0,
+          "avg_days_to_pass": null,
+          "median_days_pass": null,
+          "avg_days_to_blow": 28.5,
+          "avg_max_dd": -3644.74,
+          "avg_max_dd_pass": null,
+          "avg_contracts": 15,
+          "monthly_gross_est": -2402.0,
+          "monthly_net_est": -1922.0,
+          "risk_per_trade": 300.0,
+          "trades_per_day_input": 1.0
+        },
+        {
+          "risk_mode": "NORMAL",
+          "n_sims": 2000,
+          "pass_rate": 0.008,
+          "blow_rate": 0.992,
+          "timeout_rate": 0.0,
+          "avg_days_to_pass": 42.5,
+          "median_days_pass": 38.5,
+          "avg_days_to_blow": 27.3,
+          "avg_max_dd": -4060.85,
+          "avg_max_dd_pass": -1872.92,
+          "avg_contracts": 20,
+          "monthly_gross_est": -3202.0,
+          "monthly_net_est": -2562.0,
+          "risk_per_trade": 500.0,
+          "trades_per_day_input": 1.0
+        },
+        {
+          "risk_mode": "AGGRESSIVE",
+          "n_sims": 2000,
+          "pass_rate": 0.0035,
+          "blow_rate": 0.9965,
+          "timeout_rate": 0.0,
+          "avg_days_to_pass": 36.3,
+          "median_days_pass": 34.0,
+          "avg_days_to_blow": 21.6,
+          "avg_max_dd": -3989.48,
+          "avg_max_dd_pass": -1716.43,
+          "avg_contracts": 20,
+          "monthly_gross_est": -3202.0,
+          "monthly_net_est": -2562.0,
+          "risk_per_trade": 800.0,
+          "trades_per_day_input": 1.0
+        }
+      ]
+    }
+  },
+  "grid_top_5": [
+    {
+      "variant": "A",
+      "target_r": 1.5,
+      "min_sweep_pts": 1.0,
+      "n_trades": 14,
+      "win_rate": 0.6429,
+      "profit_factor": 3.927,
+      "expectancy_pts": 4.704,
+      "total_pts": 65.85,
+      "max_dd_pts": -7.95,
+      "trades_per_day": 1.0,
+      "grade": "A \u2014 Strong edge, viable for live trading"
+    },
+    {
+      "variant": "A",
+      "target_r": 2.0,
+      "min_sweep_pts": 1.0,
+      "n_trades": 14,
+      "win_rate": 0.5714,
+      "profit_factor": 3.048,
+      "expectancy_pts": 4.293,
+      "total_pts": 60.1,
+      "max_dd_pts": -14.8,
+      "trades_per_day": 1.0,
+      "grade": "B \u2014 Moderate edge, needs more validation"
+    },
+    {
+      "variant": "A",
+      "target_r": 1.5,
+      "min_sweep_pts": 0.25,
+      "n_trades": 19,
+      "win_rate": 0.5263,
+      "profit_factor": 1.837,
+      "expectancy_pts": 1.933,
+      "total_pts": 36.72,
+      "max_dd_pts": -18.2,
+      "trades_per_day": 1.0,
+      "grade": "C \u2014 Weak edge, research-only"
+    },
+    {
+      "variant": "A",
+      "target_r": 3.0,
+      "min_sweep_pts": 1.0,
+      "n_trades": 14,
+      "win_rate": 0.5,
+      "profit_factor": 1.774,
+      "expectancy_pts": 2.346,
+      "total_pts": 32.85,
+      "max_dd_pts": -14.8,
+      "trades_per_day": 1.0,
+      "grade": "C \u2014 Weak edge, research-only"
+    },
+    {
+      "variant": "A",
+      "target_r": 1.5,
+      "min_sweep_pts": 0.5,
+      "n_trades": 18,
+      "win_rate": 0.5,
+      "profit_factor": 1.58,
+      "expectancy_pts": 1.511,
+      "total_pts": 27.2,
+      "max_dd_pts": -21.2,
+      "trades_per_day": 1.0,
+      "grade": "C \u2014 Weak edge, research-only"
+    }
+  ],
+  "in_out_of_sample": {
+    "A": {
+      "in_sample": {
+        "n_days": 30,
+        "n_trades": 12,
+        "win_rate": 0.5,
+        "profit_factor": 1.152,
+        "expectancy_pts": 0.442,
+        "total_pts": 5.3
+      },
+      "out_of_sample": {
+        "n_days": 21,
+        "n_trades": 7,
+        "win_rate": 0.4286,
+        "profit_factor": 2.465,
+        "expectancy_pts": 3.329,
+        "total_pts": 23.3
+      }
+    },
+    "B": {
+      "in_sample": {
+        "n_days": 30,
+        "n_trades": 29,
+        "win_rate": 0.4138,
+        "profit_factor": 1.55,
+        "expectancy_pts": 1.426,
+        "total_pts": 41.35
+      },
+      "out_of_sample": {
+        "n_days": 21,
+        "n_trades": 19,
+        "win_rate": 0.3684,
+        "profit_factor": 1.24,
+        "expectancy_pts": 0.861,
+        "total_pts": 16.35
+      }
+    },
+    "C": {
+      "in_sample": {
+        "n_days": 30,
+        "n_trades": 7,
+        "win_rate": 0.1429,
+        "profit_factor": 0.316,
+        "expectancy_pts": -2.6,
+        "total_pts": -18.2
+      },
+      "out_of_sample": {
+        "n_days": 21,
+        "n_trades": 3,
+        "win_rate": 0.6667,
+        "profit_factor": 1.353,
+        "expectancy_pts": 0.983,
+        "total_pts": 2.95
+      }
+    }
+  },
+  "slippage_stress": {
+    "A": {
+      "+0.0pts": {
+        "profit_factor": 1.564,
+        "expectancy_pts": 1.505,
+        "total_pts": 28.6
+      },
+      "+0.5pts": {
+        "profit_factor": 1.343,
+        "expectancy_pts": 1.005,
+        "total_pts": 19.1
+      },
+      "+1.0pts": {
+        "profit_factor": 1.157,
+        "expectancy_pts": 0.505,
+        "total_pts": 9.6
+      },
+      "+2.0pts": {
+        "profit_factor": 0.87,
+        "expectancy_pts": -0.495,
+        "total_pts": -9.4
+      },
+      "+3.0pts": {
+        "profit_factor": 0.665,
+        "expectancy_pts": -1.495,
+        "total_pts": -28.4
+      }
+    },
+    "B": {
+      "+0.0pts": {
+        "profit_factor": 1.402,
+        "expectancy_pts": 1.202,
+        "total_pts": 57.7
+      },
+      "+0.5pts": {
+        "profit_factor": 1.213,
+        "expectancy_pts": 0.702,
+        "total_pts": 33.7
+      },
+      "+1.0pts": {
+        "profit_factor": 1.056,
+        "expectancy_pts": 0.202,
+        "total_pts": 9.7
+      },
+      "+2.0pts": {
+        "profit_factor": 0.81,
+        "expectancy_pts": -0.798,
+        "total_pts": -38.3
+      },
+      "+3.0pts": {
+        "profit_factor": 0.626,
+        "expectancy_pts": -1.798,
+        "total_pts": -86.3
+      }
+    },
+    "C": {
+      "+0.0pts": {
+        "profit_factor": 0.564,
+        "expectancy_pts": -1.525,
+        "total_pts": -15.25
+      },
+      "+0.5pts": {
+        "profit_factor": 0.473,
+        "expectancy_pts": -2.025,
+        "total_pts": -20.25
+      },
+      "+1.0pts": {
+        "profit_factor": 0.398,
+        "expectancy_pts": -2.525,
+        "total_pts": -25.25
+      },
+      "+2.0pts": {
+        "profit_factor": 0.28,
+        "expectancy_pts": -3.525,
+        "total_pts": -35.25
+      },
+      "+3.0pts": {
+        "profit_factor": 0.193,
+        "expectancy_pts": -4.525,
+        "total_pts": -45.25
+      }
+    }
+  },
+  "time_window_test": {
+    "A": {
+      "9:30-10:00": {
+        "n_trades": 12,
+        "win_rate": 0.5,
+        "profit_factor": 1.919,
+        "expectancy_pts": 2.171
+      },
+      "9:30-10:30": {
+        "n_trades": 16,
+        "win_rate": 0.4375,
+        "profit_factor": 2.059,
+        "expectancy_pts": 3.353
+      },
+      "9:30-11:00": {
+        "n_trades": 19,
+        "win_rate": 0.4211,
+        "profit_factor": 1.655,
+        "expectancy_pts": 1.821
+      },
+      "9:30-11:30": {
+        "n_trades": 19,
+        "win_rate": 0.4737,
+        "profit_factor": 1.564,
+        "expectancy_pts": 1.505
+      }
+    }
+  }
+}
