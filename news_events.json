@@ -1,12 +1,233 @@
 [
-  {"date": "2026-06-05", "event": "NFP",  "hour": 8,  "minute": 30},
-  {"date": "2026-07-03", "event": "NFP",  "hour": 8,  "minute": 30},
-  {"date": "2026-08-07", "event": "NFP",  "hour": 8,  "minute": 30},
-  {"date": "2026-09-04", "event": "NFP",  "hour": 8,  "minute": 30},
-  {"date": "2026-10-02", "event": "NFP",  "hour": 8,  "minute": 30},
-  {"date": "2026-11-06", "event": "NFP",  "hour": 8,  "minute": 30},
-  {"date": "2026-12-04", "event": "NFP",  "hour": 8,  "minute": 30},
-  {"date": "2027-01-08", "event": "NFP",  "hour": 8,  "minute": 30},
-  {"date": "2027-02-05", "event": "NFP",  "hour": 8,  "minute": 30},
-  {"date": "2027-03-05", "event": "NFP",  "hour": 8,  "minute": 30}
+  {
+    "date": "2026-06-10",
+    "event": "CPI",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-06-11",
+    "event": "FOMC",
+    "hour": 14,
+    "minute": 0,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-06-11",
+    "event": "PPI",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-07-03",
+    "event": "NFP",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-07-10",
+    "event": "CPI",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-07-11",
+    "event": "PPI",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-07-29",
+    "event": "FOMC",
+    "hour": 14,
+    "minute": 0,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-08-07",
+    "event": "NFP",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-08-12",
+    "event": "CPI",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-08-13",
+    "event": "PPI",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-09-04",
+    "event": "NFP",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-09-10",
+    "event": "CPI",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-09-11",
+    "event": "PPI",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-09-16",
+    "event": "FOMC",
+    "hour": 14,
+    "minute": 0,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-10-02",
+    "event": "NFP",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-10-13",
+    "event": "CPI",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-10-14",
+    "event": "PPI",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-11-04",
+    "event": "FOMC",
+    "hour": 14,
+    "minute": 0,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-11-06",
+    "event": "NFP",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-11-12",
+    "event": "CPI",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-11-13",
+    "event": "PPI",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-12-04",
+    "event": "NFP",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-12-10",
+    "event": "CPI",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-12-11",
+    "event": "PPI",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2026-12-16",
+    "event": "FOMC",
+    "hour": 14,
+    "minute": 0,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2027-01-08",
+    "event": "NFP",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2027-01-14",
+    "event": "CPI",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2027-01-28",
+    "event": "FOMC",
+    "hour": 14,
+    "minute": 0,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2027-02-05",
+    "event": "NFP",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2027-02-11",
+    "event": "CPI",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2027-03-05",
+    "event": "NFP",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2027-03-11",
+    "event": "CPI",
+    "hour": 8,
+    "minute": 30,
+    "impact": "HIGH"
+  },
+  {
+    "date": "2027-03-17",
+    "event": "FOMC",
+    "hour": 14,
+    "minute": 0,
+    "impact": "HIGH"
+  }
 ]

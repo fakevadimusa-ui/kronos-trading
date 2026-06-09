@@ -64,6 +64,10 @@ MIN_SL_ATR_MULT     = 0.5
 SYMBOL              = "SPY"     # Alpaca execution (paper account uses equities)
 SIGNAL_TICKER       = "ES=F"    # yfinance source for ICT signal
 
+# ── Quality gates ─────────────────────────────────────────────────────────────
+MIN_SESSION_ATR     = 2.0    # skip trade if 14-bar ATR < this (dead market)
+FVG_QUALITY_MIN     = 70     # minimum fvg_quality_score() to take the trade
+
 # ── Entry window (ET) ─────────────────────────────────────────────────────────
 WINDOW_OPEN  = (9,  30)
 WINDOW_CLOSE = (10, 30)
@@ -150,7 +154,7 @@ def clear_state() -> None:
 
 def fetch_bars(bars: int = 60) -> pd.DataFrame:
     """5-min ES=F bars via yfinance (Globex — includes pre-market)."""
-    raw = yf.download("ES=F", period="1d", interval="5m",
+    raw = yf.download("ES=F", period="2d", interval="5m",
                       auto_adjust=True, progress=False)
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
@@ -158,6 +162,8 @@ def fetch_bars(bars: int = 60) -> pd.DataFrame:
     df.index = (pd.to_datetime(df.index, utc=True)
                 .tz_convert("America/New_York").tz_localize(None))
     df.index.name = "Datetime"
+    # Drop the last (still-forming) bar to prevent intra-bar signal triggering
+    df = df.iloc[:-1]
     return df.sort_index().tail(bars)
 
 
@@ -197,8 +203,12 @@ def compute_signal(df: pd.DataFrame) -> dict | None:
     # PDH / PDL
     daily = df.groupby("_date").agg(dh=("High","max"), dl=("Low","min"))
     df    = df.join(daily.shift(1).rename(columns={"dh":"pdh","dl":"pdl"}), on="_date")
-    df["judas_bear"] = (df["High"] > df["pdh"].fillna(-np.inf)).groupby(df["_date"]).transform("cummax")
-    df["judas_bull"] = (df["Low"]  < df["pdl"].fillna(np.inf)).groupby(df["_date"]).transform("cummax")
+    # 30-bar sliding window — Judas sweep expires after 150 min (30 × 5-min bars)
+    # Replaces cummax() which was sticky all day and caused late false signals
+    _jbear = (df["High"] > df["pdh"].fillna(-np.inf)).astype(float)
+    _jbull = (df["Low"]  < df["pdl"].fillna(np.inf)).astype(float)
+    df["judas_bear"] = _jbear.rolling(30, min_periods=1).max().astype(bool)
+    df["judas_bull"] = _jbull.rolling(30, min_periods=1).max().astype(bool)
 
     # HTF 1H bias (no lookahead)
     df_1h = df.resample("1h").agg(High=("High","max"), Low=("Low","min"),
@@ -243,8 +253,43 @@ def compute_signal(df: pd.DataFrame) -> dict | None:
         log.info(f"Outside NY window ({WINDOW_OPEN}–{WINDOW_CLOSE}) — no entry")
         return None
 
+    # Minimum session ATR gate — skip dead/holiday-thin markets
+    if atr < MIN_SESSION_ATR:
+        log.info(f"Session ATR {atr:.2f} < {MIN_SESSION_ATR} minimum — skip")
+        return None
+
+    # Volume filter: skip thin-market bars (spread inflated, fills worse)
+    vol_ma = df["Volume"].rolling(14, min_periods=1).mean().iloc[-1]
+    if vol_ma > 0 and row["Volume"] < 0.8 * vol_ma:
+        log.info(f"Low volume ({row['Volume']:.0f} < 80% of 14-bar avg {vol_ma:.0f}) — skip")
+        return None
+
+    # Daily HTF bias — no lookahead: fetch previous day's daily candle
+    # Returns "bull", "bear", or "neutral"
+    _daily_bias = "neutral"
+    try:
+        _d1 = yf.download("ES=F", period="5d", interval="1d",
+                          auto_adjust=True, progress=False)
+        if isinstance(_d1.columns, pd.MultiIndex):
+            _d1.columns = _d1.columns.get_level_values(0)
+        if len(_d1) >= 3:
+            # Use the bar two days ago (fully closed, no lookahead risk)
+            _prev2 = _d1.iloc[-3]
+            _prev1 = _d1.iloc[-2]
+            _hh = _prev1["High"] > _prev2["High"]
+            _hl = _prev1["Low"]  > _prev2["Low"]
+            _lh = _prev1["High"] < _prev2["High"]
+            _ll = _prev1["Low"]  < _prev2["Low"]
+            if _hh and _hl:
+                _daily_bias = "bull"
+            elif _lh and _ll:
+                _daily_bias = "bear"
+    except Exception as _db_err:
+        log.debug(f"Daily bias fetch failed ({_db_err}) — using neutral")
+    log.info(f"Daily HTF bias: {_daily_bias}")
+
     # LONG
-    if (row["judas_bull"] and row["htf_bias"] != "bear" and
+    if (row["judas_bull"] and row["htf_bias"] != "bear" and _daily_bias != "bear" and
             not np.isnan(row["bull_fvg_t"]) and
             row["Low"] <= row["bull_fvg_t"] + ha and
             row["Close"] >= row["bull_fvg_b"] - ha and
@@ -257,12 +302,26 @@ def compute_signal(df: pd.DataFrame) -> dict | None:
         contracts = min(int(MAX_TRADE_RISK / (risk * ES_MULT)), MAX_CONTRACTS)
         if contracts < 1:
             return None
-        log.info(f"LONG signal price={price:.2f} sl={sl:.2f} tp={price+risk*RR:.2f} sz={contracts}ct")
+        try:
+            from ict_quality import fvg_quality_score, score_breakdown, SCORE_THRESHOLD
+            _cached_vix = float(yf.download("^VIX", period="2d", interval="1d",
+                                            auto_adjust=True, progress=False)["Close"].iloc[-1])
+            _bd  = score_breakdown(row, df, "BUY", atr, _cached_vix)
+            _score = _bd["total"]
+            log.info(f"FVG quality score BUY: {_score}/100  {_bd}")
+            if _score < FVG_QUALITY_MIN:
+                log.info(f"LONG rejected: quality score {_score} < {FVG_QUALITY_MIN}")
+                return None
+        except Exception as _qs_err:
+            _score = 50   # neutral fallback — don't block if scorer unavailable
+            log.warning(f"FVG quality scorer failed ({_qs_err}) — using neutral score")
+        log.info(f"LONG signal price={price:.2f} sl={sl:.2f} tp={price+risk*RR:.2f} sz={contracts}ct quality={_score}")
         return dict(side="BUY", entry=round(price,2), sl=round(sl,2),
-                    tp=round(price+risk*RR,2), risk=round(risk,4), contracts=contracts, atr=round(atr,4))
+                    tp=round(price+risk*RR,2), risk=round(risk,4), contracts=contracts,
+                    atr=round(atr,4), quality_score=_score)
 
     # SHORT
-    if (row["judas_bear"] and row["htf_bias"] != "bull" and
+    if (row["judas_bear"] and row["htf_bias"] != "bull" and _daily_bias != "bull" and
             not np.isnan(row["bear_fvg_b"]) and
             row["High"] >= row["bear_fvg_b"] - ha and
             row["Close"] <= row["bear_fvg_t"] + ha and
@@ -278,9 +337,23 @@ def compute_signal(df: pd.DataFrame) -> dict | None:
         contracts = min(int(MAX_TRADE_RISK / (risk * ES_MULT)), MAX_CONTRACTS)
         if contracts < 1:
             return None
-        log.info(f"SHORT signal price={price:.2f} sl={sl:.2f} tp={tp:.2f} sz={contracts}ct")
+        try:
+            from ict_quality import fvg_quality_score, score_breakdown, SCORE_THRESHOLD
+            _cached_vix = float(yf.download("^VIX", period="2d", interval="1d",
+                                            auto_adjust=True, progress=False)["Close"].iloc[-1])
+            _bd    = score_breakdown(row, df, "SELL", atr, _cached_vix)
+            _score = _bd["total"]
+            log.info(f"FVG quality score SELL: {_score}/100  {_bd}")
+            if _score < FVG_QUALITY_MIN:
+                log.info(f"SHORT rejected: quality score {_score} < {FVG_QUALITY_MIN}")
+                return None
+        except Exception as _qs_err:
+            _score = 50
+            log.warning(f"FVG quality scorer failed ({_qs_err}) — using neutral score")
+        log.info(f"SHORT signal price={price:.2f} sl={sl:.2f} tp={tp:.2f} sz={contracts}ct quality={_score}")
         return dict(side="SELL", entry=round(price,2), sl=round(sl,2),
-                    tp=round(tp,2), risk=round(risk,4), contracts=contracts, atr=round(atr,4))
+                    tp=round(tp,2), risk=round(risk,4), contracts=contracts,
+                    atr=round(atr,4), quality_score=_score)
 
     log.info("No ICT NY setup on current bar.")
     return None
@@ -322,7 +395,7 @@ def place_bracket(client, symbol: str, side: str, qty: int,
         symbol       = symbol,
         qty          = qty,
         side         = side_enum,
-        time_in_force= TimeInForce.GTC,
+        time_in_force= TimeInForce.DAY,
         order_class  = OrderClass.BRACKET,
         stop_loss    = {"stop_price": round(sl, 2)},
         take_profit  = {"limit_price": round(tp, 2)},
@@ -448,6 +521,29 @@ def main() -> None:
         if not (window_open <= now_et < window_close):
             log.info("Outside NY entry window — standing by.")
             return
+
+        # ── VIX regime gate ───────────────────────────────────────────────
+        try:
+            vix_df = yf.download("^VIX", period="2d", interval="1d",
+                                 auto_adjust=True, progress=False)
+            vix = float(vix_df["Close"].iloc[-1]) if not vix_df.empty else 0.0
+            if vix > 25.0:
+                log.info(f"VIX {vix:.1f} > 25 — ICT suspended (regime-change mode)")
+                return
+            log.info(f"VIX {vix:.1f} — clear to trade")
+        except Exception as _vix_err:
+            log.warning(f"VIX check failed ({_vix_err}) — proceeding without gate")
+
+        # ── Challenge guard ───────────────────────────────────────────────
+        try:
+            from challenge_mode import ChallengeGuard
+            _guard = ChallengeGuard()
+            _allowed, _reason = _guard.can_trade("ICT")
+            if not _allowed:
+                log.info(f"Challenge guard blocked: {_reason}")
+                return
+        except Exception as _cg_err:
+            log.warning(f"ChallengeGuard unavailable ({_cg_err}) — continuing")
 
         # ── Fetch + signal ────────────────────────────────────────────────
         df = fetch_bars(60)
