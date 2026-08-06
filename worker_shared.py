@@ -249,7 +249,7 @@ class WorkerGuards:
             if not self.day_lock_path.exists():
                 return False
             lock = json.loads(self.day_lock_path.read_text())
-            if lock.get("locked_date") == datetime.now().date().isoformat():
+            if lock.get("locked_date") == datetime.now(ET).date().isoformat():
                 self.log(f"[PADLOCK] Circuit breaker active — locked at {lock.get('locked_at')} "
                          f"| Reason: {lock.get('reason')} | Unlock: {lock.get('unlock_after')}")
                 return True
@@ -258,7 +258,7 @@ class WorkerGuards:
         return False
 
     def engage_day_lock(self, reason: str, loss_count: int) -> None:
-        today     = datetime.now()
+        today     = datetime.now(ET)
         next_open = (today.date() + timedelta(days=1)).isoformat() + " 09:30:00 ET"
         lock = {
             "locked_date":  today.date().isoformat(),
@@ -281,8 +281,8 @@ class WorkerGuards:
             self.log(f"[WARN] Could not write day-lock: {e}")
 
     def record_loss(self, pnl: float, reason: str = "") -> int:
-        today = datetime.now().date().isoformat()
-        entry = {"date": today, "ts": datetime.now().isoformat(),
+        today = datetime.now(ET).date().isoformat()
+        entry = {"date": today, "ts": datetime.now(ET).isoformat(),
                  "pnl": round(pnl, 2), "reason": reason}
         try:
             with open(self.loss_log_path, "a") as f:
@@ -294,8 +294,8 @@ class WorkerGuards:
         return total
 
     def record_win(self, pnl: float) -> None:
-        today = datetime.now().date().isoformat()
-        entry = {"date": today, "ts": datetime.now().isoformat(),
+        today = datetime.now(ET).date().isoformat()
+        entry = {"date": today, "ts": datetime.now(ET).isoformat(),
                  "pnl": round(pnl, 2), "type": "win"}
         try:
             with open(self.loss_log_path, "a") as f:
@@ -305,7 +305,7 @@ class WorkerGuards:
 
     def count_losses_today_local(self) -> int:
         """Local append-log count — used for magnitude gate + audit."""
-        today = datetime.now().date().isoformat()
+        today = datetime.now(ET).date().isoformat()
         try:
             if not self.loss_log_path.exists():
                 return 0
@@ -391,7 +391,7 @@ class WorkerGuards:
         # Magnitude gate
         local_losses = []
         try:
-            today = datetime.now().date().isoformat()
+            today = datetime.now(ET).date().isoformat()
             if self.loss_log_path.exists():
                 with open(self.loss_log_path) as f:
                     for line in f:

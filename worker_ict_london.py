@@ -156,6 +156,8 @@ def fetch_bars(bars: int = 80) -> pd.DataFrame:
     df.index = (pd.to_datetime(df.index, utc=True)
                 .tz_convert("America/New_York").tz_localize(None))
     df.index.name = "Datetime"
+    # Drop the last (still-forming) bar to prevent intra-bar signal triggering
+    df = df.iloc[:-1]
     return df.sort_index().tail(bars)
 
 
@@ -336,7 +338,7 @@ def place_bracket(client, symbol: str, side: str, qty: int,
         symbol          = symbol,
         qty             = qty,
         side            = side_enum,
-        time_in_force   = TimeInForce.GTC,
+        time_in_force   = TimeInForce.DAY,
         order_class     = OrderClass.BRACKET,
         stop_loss       = {"stop_price":  round(sl, 2)},
         take_profit     = {"limit_price": round(tp, 2)},
