@@ -16,9 +16,15 @@ Strategy: ICT London Judas Swing
 Risk parameters:
   SL floor  : raw_sl ≥ 0.5 × ATR14
   Max risk  : $250 per trade (slightly tighter than NY — London is choppier)
-  Max size  : 3 contracts
   RR target : 3.0 (1:3 — London reversals tend to be shorter lived)
   Stagnation: 8 bars (40 min) — London session is time-pressured
+
+Execution note:
+  Signal (entry/SL/TP) is computed on ES=F futures bars, but the bracket
+  order is submitted against SPY stock on Alpaca. compute_signal() returns
+  ES-scale numbers only; main() converts them to SPY's real price scale
+  and SPY-share position size via worker_shared.es_signal_to_spy() before
+  ever touching the broker. See that function for the conversion math.
 
 ISOLATION GUARANTEES:
   - Reads credentials from .env.ict (same ICT-Challenge account as NY worker
@@ -58,8 +64,6 @@ FVG_LOOKBACK        = 6      # slightly shorter — London FVGs go stale faster
 ATR_MULT            = 0.5
 RR                  = 3.0    # 1:3 for London (shorter trend bursts vs NY 1:4)
 MAX_TRADE_RISK      = 250    # $250 — tighter in London (more choppy)
-ES_MULT             = 50.0
-MAX_CONTRACTS       = 3      # max 3 in London (vs 4 in NY)
 STAGNATION_BARS     = 8      # 40 min max (London close pressure)
 MIN_SL_ATR_MULT     = 0.5
 SYMBOL              = "SPY"
@@ -74,7 +78,8 @@ DAILY_LOSS_LIMIT = 2
 
 # ── Bootstrap shared utilities ────────────────────────────────────────────────
 from worker_shared import (
-    make_logger, load_credentials, send_telegram, RunLock, WorkerGuards
+    make_logger, load_credentials, send_telegram, RunLock, WorkerGuards,
+    get_live_spy_quote, es_signal_to_spy,
 )
 
 log    = make_logger(WORKER_NAME, LOG_DIR)
@@ -269,13 +274,11 @@ def compute_signal(df: pd.DataFrame) -> dict | None:
         if risk < MIN_SL_ATR_MULT * atr or risk > price * 0.03:
             log.info(f"LONG rejected: risk={risk:.2f} atr_floor={MIN_SL_ATR_MULT*atr:.2f}")
             return None
-        contracts = min(int(MAX_TRADE_RISK / (risk * ES_MULT)), MAX_CONTRACTS)
-        if contracts < 1:
-            return None
-        log.info(f"LONG signal price={price:.2f} sl={sl:.2f} tp={price+risk*RR:.2f} sz={contracts}ct")
+        # entry/sl/tp/risk are still ES=F futures points here — main() converts
+        # to SPY's real price scale + share size via es_signal_to_spy().
+        log.info(f"LONG signal (ES scale) price={price:.2f} sl={sl:.2f} tp={price+risk*RR:.2f}")
         return dict(side="BUY", entry=round(price,2), sl=round(sl,2),
-                    tp=round(price+risk*RR,2), risk=round(risk,4),
-                    contracts=contracts, atr=round(atr,4))
+                    tp=round(price+risk*RR,2), risk=round(risk,4), atr=round(atr,4))
 
     # SHORT
     if (row["judas_bear"] and row["htf_bias"] != "bull" and
@@ -291,13 +294,11 @@ def compute_signal(df: pd.DataFrame) -> dict | None:
         tp = price - risk * RR
         if tp <= 0:
             return None
-        contracts = min(int(MAX_TRADE_RISK / (risk * ES_MULT)), MAX_CONTRACTS)
-        if contracts < 1:
-            return None
-        log.info(f"SHORT signal price={price:.2f} sl={sl:.2f} tp={tp:.2f} sz={contracts}ct")
+        # entry/sl/tp/risk are still ES=F futures points here — main() converts
+        # to SPY's real price scale + share size via es_signal_to_spy().
+        log.info(f"SHORT signal (ES scale) price={price:.2f} sl={sl:.2f} tp={tp:.2f}")
         return dict(side="SELL", entry=round(price,2), sl=round(sl,2),
-                    tp=round(tp,2), risk=round(risk,4),
-                    contracts=contracts, atr=round(atr,4))
+                    tp=round(tp,2), risk=round(risk,4), atr=round(atr,4))
 
     log.info("No ICT London setup on current bar.")
     return None
@@ -420,19 +421,20 @@ def main() -> None:
                 filled = [o for o in recent if o.filled_at and o.filled_avg_price]
                 filled.sort(key=lambda o: o.filled_at, reverse=True)
                 if filled:
-                    exit_px   = float(filled[0].filled_avg_price)
-                    entry_px  = state["entry"]
-                    contracts = state["contracts"]
+                    exit_px  = float(filled[0].filled_avg_price)
+                    entry_px = state["entry"]
+                    shares   = state["contracts"]   # SPY share count (key kept for state compat)
+                    # SPY shares: $1 P&L per $1 move — no ES_MULT/contract multiplier.
                     pnl = ((exit_px - entry_px) if state["side"] == "BUY"
-                           else (entry_px - exit_px)) * contracts * ES_MULT
+                           else (entry_px - exit_px)) * shares
                     if pnl >= 0:
                         guards.record_win(pnl)
                         send_telegram(f"✅ ICT London WIN\n{state['side']} "
-                                      f"{contracts}x {SYMBOL}\nP&L: ${pnl:+,.2f}", log)
+                                      f"{shares}sh {SYMBOL}\nP&L: ${pnl:+,.2f}", log)
                     else:
                         guards.record_loss(pnl, "bracket_exit")
                         send_telegram(f"❌ ICT London LOSS\n{state['side']} "
-                                      f"{contracts}x {SYMBOL}\nP&L: ${pnl:+,.2f}", log)
+                                      f"{shares}sh {SYMBOL}\nP&L: ${pnl:+,.2f}", log)
             except Exception as e:
                 log.warning(f"Could not determine exit P&L: {e}")
             clear_state()
@@ -478,21 +480,43 @@ def main() -> None:
             log.info("Spread gate blocked entry.")
             return
 
-        dollar_risk = sig["contracts"] * sig["risk"] * ES_MULT
-        log.info(f"ENTRY {sig['side']} {sig['contracts']}x {SYMBOL}  "
+        # ── Convert ES=F-scale signal → SPY's real tradeable price scale ──
+        # sig here still holds ES futures points (see compute_signal). Anchor
+        # to a live SPY quote and scale the risk/reward *distance* by the
+        # live ES:SPY ratio before this ever reaches the broker.
+        try:
+            spy_quote = get_live_spy_quote(ENV_FILE, SYMBOL)
+        except Exception as e:
+            log.error(f"[HALT] Could not fetch live SPY quote — standing down: {e}")
+            return
+
+        es_ref_price = sig["entry"]   # ES=F close of the signal bar
+        sig = es_signal_to_spy(sig, es_ref_price, spy_quote, MAX_TRADE_RISK)
+        log.info(f"ES→SPY conversion: ES ref={es_ref_price} SPY quote={spy_quote:.2f} "
+                 f"ratio={sig['es_spy_ratio']} | ES sl={sig['es_sl']} tp={sig['es_tp']} → "
+                 f"SPY entry={sig['entry']} sl={sig['sl']} tp={sig['tp']}")
+
+        if sig["contracts"] < 1:
+            log.info(f"Trade rejected: SPY risk distance ${sig['risk']:.2f} too large "
+                     f"for ${MAX_TRADE_RISK} budget (<1 share)")
+            return
+
+        shares      = sig["contracts"]   # SPY share count
+        dollar_risk = shares * sig["risk"]
+        log.info(f"ENTRY {sig['side']} {shares}sh {SYMBOL}  "
                  f"entry≈{sig['entry']}  sl={sig['sl']}  tp={sig['tp']}  "
                  f"risk=${dollar_risk:.0f}")
 
         try:
             order_id = place_bracket(client, SYMBOL, sig["side"],
-                                     sig["contracts"], sig["entry"],
+                                     shares, sig["entry"],
                                      sig["sl"], sig["tp"])
             save_state({**sig, "order_id": order_id, "entry_time": now_et.isoformat()})
             send_telegram(
                 f"{'🟢' if sig['side']=='BUY' else '🔴'} ICT London {sig['side']}\n"
-                f"{sig['contracts']}x {SYMBOL}\n"
+                f"{shares}sh {SYMBOL}\n"
                 f"Entry: {sig['entry']} | SL: {sig['sl']} | TP: {sig['tp']}\n"
-                f"Risk: {sig['risk']} pts = ${dollar_risk:.0f}  RR: 1:{RR}", log
+                f"Risk: {sig['risk']:.2f}/sh = ${dollar_risk:.0f}  RR: 1:{RR}", log
             )
         except Exception as e:
             log.error(f"Order failed: {e}")

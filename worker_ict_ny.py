@@ -17,7 +17,13 @@ Optimized parameters (locked — from 600-combo grid search):
 Risk gates (LOCKED — never modified):
   SL floor  : raw_sl ≥ 0.5 × ATR14
   Max risk  : $300 per trade
-  Max size  : 4 ES contracts (ES_MULT $50/pt)
+
+Execution note:
+  Signal (entry/SL/TP) is computed on ES=F futures bars, but the bracket
+  order is submitted against SPY stock on Alpaca. compute_signal() returns
+  ES-scale numbers only; main() converts them to SPY's real price scale
+  and SPY-share position size via worker_shared.es_signal_to_spy() before
+  ever touching the broker. See that function for the conversion math.
 
 ISOLATION GUARANTEES:
   - Reads credentials from .env.ict (ICT-Challenge account)
@@ -57,8 +63,6 @@ FVG_LOOKBACK        = 8
 ATR_MULT            = 0.5
 RR                  = 4.0
 MAX_TRADE_RISK      = 300
-ES_MULT             = 50.0
-MAX_CONTRACTS       = 4
 STAGNATION_BARS     = 6
 MIN_SL_ATR_MULT     = 0.5
 SYMBOL              = "SPY"     # Alpaca execution (paper account uses equities)
@@ -78,7 +82,8 @@ DAILY_LOSS_LIMIT = 2
 
 # ── Bootstrap shared utilities ────────────────────────────────────────────────
 from worker_shared import (
-    make_logger, load_credentials, send_telegram, RunLock, WorkerGuards
+    make_logger, load_credentials, send_telegram, RunLock, WorkerGuards,
+    get_live_spy_quote, es_signal_to_spy,
 )
 
 log    = make_logger(WORKER_NAME, LOG_DIR)
@@ -299,9 +304,6 @@ def compute_signal(df: pd.DataFrame) -> dict | None:
         if risk < MIN_SL_ATR_MULT * atr or risk > price * 0.03:
             log.info(f"LONG rejected: risk={risk:.2f} atr_floor={MIN_SL_ATR_MULT*atr:.2f}")
             return None
-        contracts = min(int(MAX_TRADE_RISK / (risk * ES_MULT)), MAX_CONTRACTS)
-        if contracts < 1:
-            return None
         try:
             from ict_quality import fvg_quality_score, score_breakdown, SCORE_THRESHOLD
             _cached_vix = float(yf.download("^VIX", period="2d", interval="1d",
@@ -315,9 +317,11 @@ def compute_signal(df: pd.DataFrame) -> dict | None:
         except Exception as _qs_err:
             _score = 50   # neutral fallback — don't block if scorer unavailable
             log.warning(f"FVG quality scorer failed ({_qs_err}) — using neutral score")
-        log.info(f"LONG signal price={price:.2f} sl={sl:.2f} tp={price+risk*RR:.2f} sz={contracts}ct quality={_score}")
+        # entry/sl/tp/risk are still ES=F futures points here — main() converts
+        # to SPY's real price scale + share size via es_signal_to_spy().
+        log.info(f"LONG signal (ES scale) price={price:.2f} sl={sl:.2f} tp={price+risk*RR:.2f} quality={_score}")
         return dict(side="BUY", entry=round(price,2), sl=round(sl,2),
-                    tp=round(price+risk*RR,2), risk=round(risk,4), contracts=contracts,
+                    tp=round(price+risk*RR,2), risk=round(risk,4),
                     atr=round(atr,4), quality_score=_score)
 
     # SHORT
@@ -334,9 +338,6 @@ def compute_signal(df: pd.DataFrame) -> dict | None:
         tp = price - risk * RR
         if tp <= 0:
             return None
-        contracts = min(int(MAX_TRADE_RISK / (risk * ES_MULT)), MAX_CONTRACTS)
-        if contracts < 1:
-            return None
         try:
             from ict_quality import fvg_quality_score, score_breakdown, SCORE_THRESHOLD
             _cached_vix = float(yf.download("^VIX", period="2d", interval="1d",
@@ -350,9 +351,11 @@ def compute_signal(df: pd.DataFrame) -> dict | None:
         except Exception as _qs_err:
             _score = 50
             log.warning(f"FVG quality scorer failed ({_qs_err}) — using neutral score")
-        log.info(f"SHORT signal price={price:.2f} sl={sl:.2f} tp={tp:.2f} sz={contracts}ct quality={_score}")
+        # entry/sl/tp/risk are still ES=F futures points here — main() converts
+        # to SPY's real price scale + share size via es_signal_to_spy().
+        log.info(f"SHORT signal (ES scale) price={price:.2f} sl={sl:.2f} tp={tp:.2f} quality={_score}")
         return dict(side="SELL", entry=round(price,2), sl=round(sl,2),
-                    tp=round(tp,2), risk=round(risk,4), contracts=contracts,
+                    tp=round(tp,2), risk=round(risk,4),
                     atr=round(atr,4), quality_score=_score)
 
     log.info("No ICT NY setup on current bar.")
@@ -480,20 +483,21 @@ def main() -> None:
                           if o.filled_at and o.filled_avg_price]
                 filled.sort(key=lambda o: o.filled_at, reverse=True)
                 if filled:
-                    exit_px   = float(filled[0].filled_avg_price)
-                    entry_px  = state["entry"]
-                    contracts = state["contracts"]
+                    exit_px  = float(filled[0].filled_avg_price)
+                    entry_px = state["entry"]
+                    shares   = state["contracts"]   # SPY share count (key kept for state compat)
+                    # SPY shares: $1 P&L per $1 move — no ES_MULT/contract multiplier.
                     if state["side"] == "BUY":
-                        pnl = (exit_px - entry_px) * contracts * ES_MULT
+                        pnl = (exit_px - entry_px) * shares
                     else:
-                        pnl = (entry_px - exit_px) * contracts * ES_MULT
+                        pnl = (entry_px - exit_px) * shares
                     if pnl >= 0:
                         guards.record_win(pnl)
-                        send_telegram(f"✅ ICT NY WIN\n{state['side']} {contracts}x "
+                        send_telegram(f"✅ ICT NY WIN\n{state['side']} {shares}sh "
                                       f"{SYMBOL}\nP&L: ${pnl:+,.2f}", log)
                     else:
                         guards.record_loss(pnl, "bracket_exit")
-                        send_telegram(f"❌ ICT NY LOSS\n{state['side']} {contracts}x "
+                        send_telegram(f"❌ ICT NY LOSS\n{state['side']} {shares}sh "
                                       f"{SYMBOL}\nP&L: ${pnl:+,.2f}", log)
             except Exception as e:
                 log.warning(f"Could not determine exit P&L: {e}")
@@ -565,22 +569,44 @@ def main() -> None:
             log.info("Spread gate blocked entry.")
             return
 
+        # ── Convert ES=F-scale signal → SPY's real tradeable price scale ──
+        # sig here still holds ES futures points (see compute_signal). Anchor
+        # to a live SPY quote and scale the risk/reward *distance* by the
+        # live ES:SPY ratio before this ever reaches the broker.
+        try:
+            spy_quote = get_live_spy_quote(ENV_FILE, SYMBOL)
+        except Exception as e:
+            log.error(f"[HALT] Could not fetch live SPY quote — standing down: {e}")
+            return
+
+        es_ref_price = sig["entry"]   # ES=F close of the signal bar
+        sig = es_signal_to_spy(sig, es_ref_price, spy_quote, MAX_TRADE_RISK)
+        log.info(f"ES→SPY conversion: ES ref={es_ref_price} SPY quote={spy_quote:.2f} "
+                 f"ratio={sig['es_spy_ratio']} | ES sl={sig['es_sl']} tp={sig['es_tp']} → "
+                 f"SPY entry={sig['entry']} sl={sig['sl']} tp={sig['tp']}")
+
+        if sig["contracts"] < 1:
+            log.info(f"Trade rejected: SPY risk distance ${sig['risk']:.2f} too large "
+                     f"for ${MAX_TRADE_RISK} budget (<1 share)")
+            return
+
         # ── Place order ───────────────────────────────────────────────────
-        dollar_risk = sig["contracts"] * sig["risk"] * ES_MULT
-        log.info(f"ENTRY {sig['side']} {sig['contracts']}x {SYMBOL}  "
+        shares      = sig["contracts"]   # SPY share count
+        dollar_risk = shares * sig["risk"]
+        log.info(f"ENTRY {sig['side']} {shares}sh {SYMBOL}  "
                  f"entry≈{sig['entry']}  sl={sig['sl']}  tp={sig['tp']}  "
                  f"risk=${dollar_risk:.0f}")
 
         try:
             order_id = place_bracket(client, SYMBOL, sig["side"],
-                                     sig["contracts"], sig["entry"],
+                                     shares, sig["entry"],
                                      sig["sl"], sig["tp"])
             save_state({**sig, "order_id": order_id, "entry_time": now_et.isoformat()})
             send_telegram(
                 f"{'🟢' if sig['side']=='BUY' else '🔴'} ICT NY {sig['side']}\n"
-                f"{sig['contracts']}x {SYMBOL}\n"
+                f"{shares}sh {SYMBOL}\n"
                 f"Entry: {sig['entry']} | SL: {sig['sl']} | TP: {sig['tp']}\n"
-                f"Risk: {sig['risk']} pts = ${dollar_risk:.0f}  RR: 1:{RR}", log
+                f"Risk: {sig['risk']:.2f}/sh = ${dollar_risk:.0f}  RR: 1:{RR}", log
             )
         except Exception as e:
             log.error(f"Order failed: {e}")

@@ -88,6 +88,83 @@ def load_credentials(env_file: str | None = None) -> tuple[str, str]:
 
 
 # ═══════════════════════════════════════════════════════════
+# ES=F → SPY PRICE-SCALE CONVERSION
+# ═══════════════════════════════════════════════════════════
+# The ICT signal engines compute entry/SL/TP off ES=F futures bars (yfinance),
+# but both workers execute against SPY stock on Alpaca (~1/10th the price,
+# ratio drifts over time). Orders submitted with raw ES-scale SL/TP prices
+# are nonsensical relative to SPY and get rejected outright by Alpaca.
+#
+# Fix: fetch a live SPY quote, compute the ES:SPY ratio LIVE (never hardcode
+# ~10x), anchor the real entry to the live SPY quote, and scale the ES
+# stop/target *distance* (not the absolute levels) into SPY's price scale.
+
+def get_live_spy_quote(env_file: str, symbol: str = "SPY") -> float:
+    """
+    Fetches SPY's current mid-price (bid/ask average) via Alpaca's market
+    data API — the same StockHistoricalDataClient the spread-baseline guard
+    already uses, so no new dependency.
+    """
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests   import StockLatestQuoteRequest
+
+    key, secret = load_credentials(env_file)
+    dc = StockHistoricalDataClient(key, secret)
+    q  = dc.get_stock_latest_quote(
+        StockLatestQuoteRequest(symbol_or_symbols=symbol)
+    )[symbol]
+    if q.bid_price <= 0 or q.ask_price <= 0:
+        raise RuntimeError(f"No live NBBO for {symbol} (bid={q.bid_price} ask={q.ask_price})")
+    return (q.bid_price + q.ask_price) / 2.0
+
+
+def es_signal_to_spy(sig: dict, es_ref_price: float, spy_quote: float,
+                      max_trade_risk: float) -> dict:
+    """
+    Converts an ES=F-scale ICT signal (entry/sl/tp in ES futures points)
+    into SPY's actual tradeable price scale.
+
+      - Real entry is anchored to the live SPY quote (not the ES price).
+      - SL/TP *distances* (not absolute levels) are scaled by the live
+        ES:SPY ratio = es_ref_price / spy_quote, computed fresh each call.
+      - Position is resized to SPY shares so real dollar risk == max_trade_risk
+        (SPY shares are $1 P&L per $1 move — no ES_MULT/contract multiplier).
+
+    Returns sig merged with SPY-scale entry/sl/tp/risk/contracts(=shares),
+    plus the original ES-scale values preserved under es_* keys for logging.
+    """
+    ratio = es_ref_price / spy_quote
+
+    es_risk_distance    = sig["risk"]
+    es_reward_distance  = abs(sig["tp"] - sig["entry"])
+
+    spy_risk_distance   = es_risk_distance   / ratio
+    spy_reward_distance = es_reward_distance / ratio
+
+    spy_entry = spy_quote
+    if sig["side"] == "BUY":
+        spy_sl = spy_entry - spy_risk_distance
+        spy_tp = spy_entry + spy_reward_distance
+    else:
+        spy_sl = spy_entry + spy_risk_distance
+        spy_tp = spy_entry - spy_reward_distance
+
+    shares = int(max_trade_risk / spy_risk_distance) if spy_risk_distance > 0 else 0
+
+    return {
+        **sig,
+        "es_entry": sig["entry"], "es_sl": sig["sl"], "es_tp": sig["tp"],
+        "es_risk": sig["risk"],
+        "entry": round(spy_entry, 2),
+        "sl": round(spy_sl, 2),
+        "tp": round(spy_tp, 2),
+        "risk": round(spy_risk_distance, 4),
+        "contracts": shares,
+        "es_spy_ratio": round(ratio, 4),
+    }
+
+
+# ═══════════════════════════════════════════════════════════
 # TELEGRAM
 # ═══════════════════════════════════════════════════════════
 
